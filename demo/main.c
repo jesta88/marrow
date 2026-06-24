@@ -16,10 +16,10 @@
  *           -/= halve/double the live entity count, [ / ] shrink/grow the Tier-A radius R_A,
  *           ; / ' shrink/grow the render-LOD radius R_mesh, K toggle whole-field bone-line skeleton,
  *           R reset perf stats, F1 toggle HUD, F2 HUD detail.
- * Flags: --count N, --lod-range R_A[,R_mesh], --skeleton,
- *        --frames N, --screenshot PATH, --validate, --validate-gpu,
- *        --bench [--bench-out FILE] [--smoke], --selftest-assets, --cycle-models,
- *        --gltf PATH [--mrw PATH]. */
+ * Flags: --count N, --lod-range R_A[,R_mesh], --skeleton, --cam X,Y,Z[,yaw,pitch], --no-hud,
+ *        --frames N, --screenshot PATH (deterministic: fixed timestep + fixed camera + no input),
+ *        --validate, --validate-gpu, --bench [--bench-out FILE] [--smoke], --selftest-assets,
+ *        --cycle-models, --field-smoke, --gltf PATH [--mrw PATH]. */
 #include <volk.h>
 
 #define GLFW_INCLUDE_NONE
@@ -670,12 +670,67 @@ static int field_model_load(FieldModel *m, VkCtx *ctx, const ModelSource *src,
     return 1;
 }
 
+/* ------------------------------------------------------------------ deterministic capture / smoke
+ * The interactive loop advances animation with wall-clock dt and captures by frame number, so a
+ * given capture frame does NOT fix phase, blend weight, camera, or the LOD partition. These two
+ * headless drivers replace that with a FIXED timestep, a fixed camera, and no input polling, so the
+ * field renders reproducibly: the same capture frame is the same simulated time across runs. The
+ * per-frame timings the HUD shows are still the real measured ones - only the animation clock is
+ * fixed. */
+
+/* Drive `frames` fixed-step field frames from the (fixed) camera, drawing the HUD. If `shot` is set,
+ * request the screenshot on the last frame. A swapchain-rebuild skip does not advance the count, so
+ * the captured frame is always the same simulated time. */
+static void field_capture(VkCtx *ctx, Profiler *prof, Ground *ground, Field *field, Hud *hud,
+                          Camera *cam, const char *model, int frames, const char *shot) {
+    const float dt = 1.0f / 60.0f;   /* fixed step: reproducible phase / weight / LOD partition */
+    if (frames < 1) frames = 1;
+    int rendered = 0;
+    while (rendered < frames) {
+        glfwPollEvents();            /* pump the OS message queue; input is deliberately ignored */
+        if (shot && rendered == frames - 1) vkc_request_screenshot(ctx, shot);
+        if (field_frame(ctx, prof, ground, field, hud, cam, dt, model, 1)) rendered++;
+    }
+}
+
+/* Headless field+skeleton smoke (hidden window, like --cycle-models): drive the unified LOD field
+ * for a few fixed-step frames in BOTH render modes so every field draw path is CI-exercised -
+ * default (near Tier-A mesh + far Tier-B mesh band + far bone-line tail past R_mesh), then the
+ * global all-skeleton toggle (whole field as bone lines). Asserts the per-frame split actually
+ * populated each band, so a regression that silently drops a draw fails instead of passing green.
+ * The caller sizes the field so all three bands are guaranteed non-empty. Returns 0 on pass. */
+static int field_smoke_run(VkCtx *ctx, Profiler *prof, Ground *ground, Field *field, Hud *hud, Camera *cam) {
+    const int per_mode = 8;
+    int rc = 0;
+
+    /* combined headline: near Tier-A mesh + far Tier-B mesh band + far bone-line tail */
+    field->skeleton_all = 0;
+    field_capture(ctx, prof, ground, field, hud, cam, "(field-smoke)", per_mode, NULL);
+    uint32_t near0 = field->near_count, mesh0 = field->far_mesh_count, skel0 = field->far_skel_count;
+    if (near0 == 0) { fprintf(stderr, "[field-smoke] FAIL: no near Tier-A entities\n"); rc = 1; }
+    if (mesh0 == 0) { fprintf(stderr, "[field-smoke] FAIL: no far Tier-B mesh band\n"); rc = 1; }
+    if (skel0 == 0) { fprintf(stderr, "[field-smoke] FAIL: no far skeleton tail\n"); rc = 1; }
+
+    /* global all-skeleton: the whole far set is the bone-line tail (no far mesh band), near as lines */
+    field->skeleton_all = 1;
+    field_capture(ctx, prof, ground, field, hud, cam, "(field-smoke)", per_mode, NULL);
+    if (field->far_mesh_count != 0)                { fprintf(stderr, "[field-smoke] FAIL: all-skeleton still drew a far mesh band\n"); rc = 1; }
+    if (field->far_skel_count != field->far_count) { fprintf(stderr, "[field-smoke] FAIL: all-skeleton far tail != far count\n"); rc = 1; }
+    if (field->near_count == 0)                    { fprintf(stderr, "[field-smoke] FAIL: no near entities for the all-skeleton near lines\n"); rc = 1; }
+
+    fprintf(stderr, "[field-smoke] %s | combined: near %u, far mesh %u, far skel %u | all-skeleton: far skel %u\n",
+            rc == 0 ? "PASS" : "FAIL", near0, mesh0, skel0, field->far_skel_count);
+    return rc;
+}
+
 int main(int argc, char **argv) {
     int max_frames = 0; const char *shot = NULL; int selftest_assets = 0;
     uint32_t count = 1600; int count_set = 0;
-    int do_validate = 0, do_validate_gpu = 0, do_bench = 0, smoke = 0, cycle_models = 0;
+    int do_validate = 0, do_validate_gpu = 0, do_bench = 0, smoke = 0, cycle_models = 0, field_smoke = 0;
     int skeleton = 0;   /* --skeleton / K: draw the WHOLE field as bone lines (global render mode) */
-    FieldLod lod = { .r_a = 35.0f, .r_mesh = 90.0f };   /* near band Tier-A; mesh out to R_mesh, skeleton tail beyond */
+    int no_hud = 0;     /* --no-hud: start with the HUD hidden (clean captures; deterministic frame) */
+    FieldLod lod = { .r_a = 35.0f, .r_mesh = 55.0f };   /* near band Tier-A; mesh out to R_mesh, skeleton tail beyond */
+    float cam_arg[5] = { 0, 0, 0, 0, 0 }; int cam_set = 0;   /* --cam X,Y,Z[,yaw,pitch]: reproducible shot framing */
     const char *gltf_path = NULL, *mrw_path = NULL, *bench_out = NULL;
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--frames") && i + 1 < argc) max_frames = atoi(argv[++i]);
@@ -688,6 +743,11 @@ int main(int argc, char **argv) {
             if (n >= 1 && ra > 0.0f) lod.r_a = ra;
             if (n >= 2 && rm > 0.0f) lod.r_mesh = rm;
         }
+        else if (!strcmp(argv[i], "--cam") && i + 1 < argc) {
+            /* X,Y,Z[,yaw,pitch] (world units / radians): override the camera for a reproducible shot */
+            int n = sscanf(argv[++i], "%f,%f,%f,%f,%f", &cam_arg[0], &cam_arg[1], &cam_arg[2], &cam_arg[3], &cam_arg[4]);
+            if (n >= 3) cam_set = 1;
+        }
         else if (!strcmp(argv[i], "--validate")) do_validate = 1;
         else if (!strcmp(argv[i], "--validate-gpu")) do_validate_gpu = 1;
         else if (!strcmp(argv[i], "--bench")) do_bench = 1;
@@ -695,14 +755,17 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--smoke")) smoke = 1;
         else if (!strcmp(argv[i], "--selftest-assets")) selftest_assets = 1;
         else if (!strcmp(argv[i], "--cycle-models")) cycle_models = 1;  /* headless switch smoke */
+        else if (!strcmp(argv[i], "--field-smoke")) field_smoke = 1;    /* headless field+skeleton smoke */
         else if (!strcmp(argv[i], "--skeleton")) skeleton = 1;
+        else if (!strcmp(argv[i], "--no-hud")) no_hud = 1;
         else if (!strcmp(argv[i], "--showcase")) heroes_set_showcase(1); /* CPU pose-ops scene (unwired in P1) */
         else if (!strcmp(argv[i], "--gltf") && i + 1 < argc) gltf_path = argv[++i];
         else if (!strcmp(argv[i], "--mrw") && i + 1 < argc) mrw_path = argv[++i];
     }
     if (count == 0) { fprintf(stderr, "--count must be >= 1; using 1\n"); count = 1; }
-    int capture_frame = max_frames > 0 ? max_frames - 1 : 5;
-    if (shot && max_frames == 0) max_frames = capture_frame + 1;
+    /* A bare --screenshot captures a deterministic frame deep enough that the GPU-timestamp readback
+     * is warmed and the HUD frame-time graph (128-sample ring) is full; --frames N overrides. */
+    if (shot && max_frames == 0) max_frames = 150;
 
     /* Startup model: the procedural biped unless --gltf overrides it (which also drives the headless
      * --validate/--bench/--screenshot flows). The interactive path additionally discovers every baked
@@ -727,7 +790,7 @@ int main(int argc, char **argv) {
     if (!glfwVulkanSupported()) { fprintf(stderr, "glfw: Vulkan not supported\n"); return 1; }
 
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-    if (do_validate_gpu || do_bench || cycle_models) glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);  /* hidden-window headless */
+    if (do_validate_gpu || do_bench || cycle_models || field_smoke) glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);  /* hidden-window headless */
     GLFWwindow *win = glfwCreateWindow(1280, 720, "marrow - Vulkan demo", NULL, NULL);
     if (!win) { fprintf(stderr, "window creation failed\n"); return 1; }
 
@@ -769,7 +832,7 @@ int main(int argc, char **argv) {
     /* The field's Tier B has no 16k ceiling, so the live-count knob (-/=) runs all the way to
      * FIELD_TOTAL_CAP. Default to a count that already shows BOTH tiers (a near Tier-A band + a large
      * far Tier-B crowd) unless --count overrode it. */
-    if (!count_set) count = 8192u;
+    if (!count_set) count = shot ? 65536u : 8192u;   /* the headline screenshot wants a massive far crowd */
     uint32_t capacity = FIELD_TOTAL_CAP;
     if (count > capacity) count = capacity;
 
@@ -781,10 +844,27 @@ int main(int argc, char **argv) {
 
     Hud hud;
     if (!hud_init(&hud, &ctx)) { fprintf(stderr, "hud init failed\n"); return 1; }
+    if (no_hud) hud.visible = 0;   /* clean capture (F1 still toggles it back on interactively) */
 
     Profiler prof; prof_init(&prof);
-    Camera cam; camera_init(&cam, v3(0.0f, 8.0f, 40.0f), 0.0f, -0.20f);
+    /* Default framing is the headline overview: looking down a vast crowd that recedes into a
+     * bone-line skeleton tail at the horizon. --cam overrides it for a different reproducible shot. */
+    Camera cam; camera_init(&cam, v3(0.0f, 14.0f, 36.0f), 0.0f, -0.34f);
+    if (cam_set) camera_init(&cam, v3(cam_arg[0], cam_arg[1], cam_arg[2]), cam_arg[3], cam_arg[4]);
 
+    int rc = 0;
+    if (field_smoke) {
+        /* deterministic CI gate: size the field so all three bands populate regardless of the flag
+         * defaults (near Tier-A within R_A, a far Tier-B mesh band, and a skeleton tail past R_mesh). */
+        uint32_t sc = capacity < 4096u ? capacity : 4096u;
+        field_set_count(&mg.field, sc);
+        mg.field.lod = (FieldLod){ .r_a = 35.0f, .r_mesh = 90.0f };
+        camera_init(&cam, v3(0.0f, 8.0f, 40.0f), 0.0f, -0.20f);
+        rc = field_smoke_run(&ctx, &prof, &ground, &mg.field, &hud, &cam);
+    } else if (shot) {
+        /* deterministic single-frame capture: fixed timestep + fixed camera + no input polling */
+        field_capture(&ctx, &prof, &ground, &mg.field, &hud, &cam, reg.items[model_idx].name, max_frames, shot);
+    } else {
     uint64_t rendered = 0;
     int cyc_seen = 1;   /* --cycle-models: models visited so far (startup counts as one) */
     int prev_f1 = 0, prev_f2 = 0, prev_r = 0, prev_m = 0;
@@ -864,8 +944,6 @@ int main(int argc, char **argv) {
         float dt = (float)(now - prev); prev = now;
         camera_update(&cam, win, dt);
 
-        if (shot && rendered == (uint64_t)capture_frame) vkc_request_screenshot(&ctx, shot);
-
         if (!field_frame(&ctx, &prof, &ground, &mg.field, &hud, &cam, dt, reg.items[model_idx].name, 1)) continue;
         rendered++;
 
@@ -876,6 +954,7 @@ int main(int argc, char **argv) {
         }
         if (max_frames > 0 && rendered >= (uint64_t)max_frames) glfwSetWindowShouldClose(win, 1);
     }
+    }   /* interactive loop (else: the deterministic --screenshot / --field-smoke paths above) */
 
     vkc_wait_idle(&ctx);
     hud_destroy(&hud, &ctx);
@@ -884,5 +963,5 @@ int main(int argc, char **argv) {
     vkc_destroy(&ctx);
     glfwDestroyWindow(win);
     glfwTerminate();
-    return 0;
+    return rc;
 }

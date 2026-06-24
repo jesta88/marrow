@@ -135,6 +135,13 @@ if (MRW_BUILD_TESTS)
     -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_bench.cmake)
   # Needs a Vulkan device + WSI surface; label it so headless runners can `ctest -LE gpu`.
   set_tests_properties(demo_bench_smoke PROPERTIES LABELS gpu)
+
+  # Headless field+skeleton smoke: drive the unified LOD field for a few fixed-step frames in both
+  # render modes (near Tier-A mesh + far Tier-B mesh band + far bone-line tail, then global all-
+  # skeleton) and assert each band populated, so a regression that drops a draw fails. Needs a
+  # Vulkan device + WSI surface like the bench smoke.
+  add_test(NAME demo_field_smoke COMMAND marrow_demo --field-smoke)
+  set_tests_properties(demo_field_smoke PROPERTIES LABELS gpu)
 endif()
 
 # ------------------------------------------------------------------ glTF asset prep (UAL1)
