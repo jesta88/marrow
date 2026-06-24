@@ -6,20 +6,11 @@
 
 ![marrow's unified LOD field: 65,536 animated characters — a near CPU Tier-A foreground continuing into a baked Tier-B GPU crowd, the far tail collapsing into a bone-line skeleton horizon](hero.jpg)
 
-*The [demo](demo/)'s unified LOD field at 65,536 entities: each character is classified per frame by camera distance into a CPU Tier-A foreground and a baked-GPU Tier-B crowd, the far tail rendered as bone-line skeletons. Capture your own with `marrow_demo --no-hud --screenshot hero.png`.*
+*The [demo](demo/)'s unified LOD field at 65,536 entities: each character is classified per frame by camera distance into a CPU Tier-A foreground and a baked-GPU Tier-B crowd, the far tail rendered as bone-line skeletons.*
 
 marrow turns skeletons and animation clips into skinning matrices. It is *batch-first*: one
 call animates `N` instances that share a skeleton, so you can drive tens of thousands of
-characters without tens of thousands of per-instance virtual calls. It never allocates, never
-touches a graphics API, and never spawns a thread it doesn't own — it emits data and the format
-specs to decode it, and leaves scheduling, GPU upload, and the animation state machine to you.
-
-> Think *ozz-animation's quality and offline pipeline, but in C with a flat universal ABI,
-> designed across-instance so the crowd case vectorizes, with a baked-texture GPU crowd tier
-> built into the same asset pipeline.*
-
-The public API is the single header [`marrow.h`](marrow.h). All symbols are prefixed `mrw_`
-(types/functions) or `MRW_` (macros/enums). The on-disk format is `.mrw` (magic `MRRW`).
+characters without tens of thousands of per-instance virtual calls.
 
 📖 **Documentation:** **<https://jesta88.github.io/marrow/>** — quick start, how-to guides,
 concepts, and the API reference (generated from `marrow.h`). Built from [`site/`](site/) with
@@ -27,40 +18,32 @@ Doxygen; see [`Doxyfile`](Doxyfile).
 
 ---
 
-## Why marrow
+## Features
 
-- **Zero runtime dependencies, zero allocation.** Pure C11, no libc beyond `<math.h>`. Every
+- **Zero runtime dependencies, zero allocation**: Pure C11, no libc beyond `<math.h>`. Every
   buffer is sized by a `*_requirements()` query that returns both **size and alignment**; you
   bring the allocator. Console- and fixed-budget-friendly.
-- **Flat C ABI.** `extern "C"`, compiles as both C11 and C++, out-params + result codes, no SIMD
-  types in public structs. Trivial to bind from any language; no C++ integration tax.
-- **Batch-first and data-oriented (SoA).** The crowd story is the spine. The hot path **fuses**
+- **Flat C ABI**: `extern "C"`, compiles as both C11 and C++, out-params + result codes, no SIMD
+  types in public structs. Trivial to bind from any language.
+- **Batch-first and data-oriented (SoA)**: The hot path **fuses**
   local → model → skinning and writes the canonical 3×4 palette directly, vectorized
   *across instances* (lane *i* = instance *i*).
-- **Runtime SIMD dispatch, no lazy globals.** Scalar, SSE2, and AVX2 (+FMA, +F16C) kernels live
+- **Runtime SIMD dispatch**: Scalar, SSE2, and AVX2 (+FMA, +F16C) kernels live
   in separately-flagged translation units. Backend selection is a small caller-owned, immutable
-  POD value — detected once, passed in. Buffer sizes never depend on the chosen backend.
-- **Safe loader.** `.mrw` is a byte-defined little-endian wire format. The loader **validates,
-  then views** — no struct overlay, no `mmap + cast`. Truncated or corrupt input fails cleanly
-  (coverage-guided fuzzed; ASan/UBSan/MSan clean).
-- **Two tiers, one core.** A CPU runtime tier and a baked-texture GPU crowd tier share the same
+  POD value. Buffer sizes never depend on the chosen backend.
+- **Safe loader**: `.mrw` is a byte-defined little-endian format. The loader **validates,
+  then views**. Truncated or corrupt input fails cleanly.
+- **Two tiers, one core**: A CPU runtime tier and a baked-texture GPU crowd tier share the same
   skeleton/clip formats, decompressor, sampler, and math.
 
 ## Performance
 
 On a shared-array rig, correctness-gated against [ozz-animation](https://github.com/guillaumeblanc/ozz-animation),
 marrow's fused across-instance AVX2 batch produces a **16 384-instance, 14-bone** skinning
-palette at **8.1 ns per (instance·joint) — 1.85 ms/frame, single-threaded — versus ozz's 34.7 ns
+palette at **8.1 ns per (instance·joint) - 1.85 ms/frame, single-threaded - versus ozz's 34.7 ns
 (7.96 ms/frame): ~4.3× faster.** The gap widens at crowd scale: ozz's per-instance sampling
 contexts (≈32 MB at 16 k) spill L3, while marrow's `O(1)` scratch stays cache-resident. (ozz
-wins at `N = 1` — wide lanes go to waste on a single instance.)
-
-*Methodology:* both libraries produce the identical per-instance `model × inverse_bind` palette for
-`N` instances of one shared rig, each sampled at its own time, single-threaded, each on its best
-backend (marrow AVX2+FMA vs ozz 0.16.0 AVX2); measured on a Ryzen 7 7700X (Zen 4), Release MSVC x64.
-The comparison is correctness-gated (sub-millimetre vertex agreement) and a no-allocation gate stays
-silent for every timed window, for both libraries. The harness lives in [`bench/`](bench/)
-(`-DMRW_BUILD_OZZ_BENCH=ON`); the methodology was independently reviewed before any number was trusted.
+wins at `N = 1`: wide lanes go to waste on a single instance.)
 
 ---
 
@@ -70,37 +53,35 @@ marrow is one skeletal pipeline with two consumption tiers, related as a fidelit
 
 ```
                 ┌──────────── shared core (C, SoA SIMD, no alloc) ────────────┐
-  .mrw blob ──► │ skeleton │ clip decode │ sample │ blend/additive/mask │ IK │ │
+  .mrw blob ──► │ skeleton │ clip decode │ sample │ blend/additive/mask │ IK  │
                 └──────────────┬──────────────────────────────────┬───────────┘
                                │                                  │ (offline tool only)
                    Tier A: CPU runtime pose           Tier B: baked per-bone palettes
-                   full control — blend trees,         fixed clip set, fixed rate,
-                   IK, partial blends, root motion     ≤2-clip cross-fade in shader
+                   full control: blend trees,         fixed clip set, fixed rate,
+                   IK, partial blends, root motion    ≤2-clip cross-fade in shader
                                │                                  │
                                ▼                                  ▼
                   canonical 3×4 skinning palette  ⇄  shader decode (same layout)
 ```
 
 - **Tier A (CPU runtime)** samples clips, blends/masks/adds poses, solves IK, runs the hierarchy,
-  and writes the skinning palette — full per-frame control, engine-driven. This is the marrow
-  runtime library.
+  and writes the skinning palette.
 - **Tier B (baked GPU crowd tier)** bakes a fixed clip set offline into per-bone `Q+T+scale`
   textures whose memory scales with `bones × frames`, not vertices. The runtime *consumes and
   validates* the baked blob; a reference vertex shader decodes it on the GPU.
 
-**The honest relationship:** Tier B is **exact at baked frames** (within half-float quantization)
-and **approximate between them** — it interpolates already-composed transforms (chord, not arc),
+Tier B is **exact at baked frames** (within half-float quantization)
+and **approximate between them**. It interpolates already-composed transforms (chord, not arc),
 so it is a frozen cache of discrete Tier A palettes with approximate temporal interpolation. It
 is right for distant crowds; promote to Tier A when exact local-space blending matters (near
-camera, gameplay-critical). marrow never grows GPU hierarchy evaluation, masks, IK, or runtime
-graphs — that's the guardrail.
+camera, gameplay-critical).
 
 ---
 
 ## Quick start
 
 marrow builds with CMake (+ Ninja recommended). The runtime itself is just the C sources under
-`src/` plus `marrow.h` — it has no third-party dependencies and can be dropped straight into an
+`src/` plus `marrow.h`. It has no third-party dependencies and can be dropped straight into an
 existing build.
 
 ### Build & test
@@ -186,16 +167,14 @@ against. See [`marrow.h`](marrow.h) for the full, documented surface.
 The runtime only *consumes* assets. Producing them lives in separate targets that may use heavy
 libraries and are never linked into the runtime:
 
-- **`gltf2marrow`** — imports a glTF 2.0 skin + animations into a v0 `.mrw` (vendored cgltf;
+- **`gltf2marrow`**: imports a glTF 2.0 skin + animations into a v0 `.mrw` (vendored cgltf;
   resamples to dense clips; self-validates before emit).
-- **`marrow-bake`** — bakes a `.mrw` clip set into a Tier-B baked texture section, polar-decomposing
+- **`marrow-bake`**: bakes a `.mrw` clip set into a Tier-B baked texture section, polar-decomposing
   each bone to `Q+T+uniform-scale`, measuring the reconstruction residual, and **rejecting rigs
-  that can't be represented** (they stay valid Tier-A assets — there is no lossy full-matrix
-  fallback).
+  that can't be represented** (they stay valid Tier-A assets).
 
 Reference GPU skinning shaders (GLSL + HLSL) that decode the baked palette live in
-[`examples/skinning/`](examples/skinning/) — example code only, not part of the zero-dependency
-runtime.
+[`examples/skinning/`](examples/skinning/).
 
 ---
 
@@ -216,19 +195,8 @@ tests/              CTest suite: parity, golden bytes, malformed-input, fuzzing.
 
 Desktop x64 and current/last-gen consoles (little-endian). **AVX2 (+FMA)** is the primary fast
 path; **SSE2** is the portable x64 baseline and fallback (also the right width for Jaguar-class
-PS4/Xbox One); **scalar** is the reference and ultimate fallback. Determinism is **visual-only** —
-FMA and reordered reductions are fair game, so results are not bit-identical across machines.
-
-## Status
-
-**First public release — 0.1.0 (pre-1.0).** The v0 contracts and the `.mrw` on-disk format are
-ratified and evolve backward-additively (new layouts arrive only as new codec/encoding ids; existing
-assets keep loading); as a 0.x release they may still gain or refine surface before 1.0. The CPU
-runtime — math core, loader, sampling, skinning palette, pose algebra, IK, root motion, and the
-across-instance SSE2/AVX2 batch path — is implemented and gated by CI across GCC / Clang (ASan+UBSan)
-/ MSVC. The public API and its contracts are documented in [`marrow.h`](marrow.h).
+PS4/Xbox One); **scalar** is the reference and fallback.
 
 ## License
 
-[MIT](LICENSE) — permissive, OSI-approved, and GPL-compatible. © 2026 Jérémie St-Amand.
-```
+[MIT](LICENSE) © 2026 Jérémie St-Amand.
