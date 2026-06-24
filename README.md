@@ -4,6 +4,10 @@
 
 **A pure-C11, zero-dependency, engine- and renderer-agnostic animation runtime for games.**
 
+![marrow's unified LOD field: 65,536 animated characters — a near CPU Tier-A foreground continuing into a baked Tier-B GPU crowd, the far tail collapsing into a bone-line skeleton horizon](hero.jpg)
+
+*The [demo](demo/)'s unified LOD field at 65,536 entities: each character is classified per frame by camera distance into a CPU Tier-A foreground and a baked-GPU Tier-B crowd, the far tail rendered as bone-line skeletons. Capture your own with `marrow_demo --no-hud --screenshot hero.png`.*
+
 marrow turns skeletons and animation clips into skinning matrices. It is *batch-first*: one
 call animates `N` instances that share a skeleton, so you can drive tens of thousands of
 characters without tens of thousands of per-instance virtual calls. It never allocates, never
