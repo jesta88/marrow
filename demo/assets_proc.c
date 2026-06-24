@@ -302,7 +302,9 @@ int assets_proc_build(ProcAssets *out) {
     uint32_t nclip = 3;
     out->clip_count = nclip;
 
-    mrw_clip clips[DEMO_PROC_MAX_CLIPS];
+    mrw_clip clips[DEMO_PROC_MAX_CLIPS] = { 0 };   /* zero so `codec` defaults to 0 (raw TRS) - the
+                                                      loop below sets every field except codec, and an
+                                                      uninitialized codec > 1 is rejected as UNSUPPORTED */
     float *samples_buf[DEMO_PROC_MAX_CLIPS] = { 0 };
     float *root_buf[DEMO_PROC_MAX_CLIPS] = { 0 };
     for (uint32_t i = 0; i < nclip; ++i) {

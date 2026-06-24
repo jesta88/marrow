@@ -18,7 +18,7 @@
 struct InstanceAnim {
     mat4  model;     /* bind->world; CPU root motion folded in              */
     uvec4 clipA;     /* first_frame, frame_count, looping, paletteIndex     */
-    uvec4 clipB;     /* first_frame, frame_count, looping, _pad             */
+    uvec4 clipB;     /* first_frame, frame_count, looping, entity id (tint) */
     vec4  times;     /* tA, tB, durA, durB                                  */
     vec4  blend;     /* w, _, _, _                                          */
 };
@@ -104,7 +104,10 @@ Xform resolveBone(int bone, InstanceAnim inst) {
     return xa;
 }
 
-/* cheap per-instance tint for crowd variety */
+/* cheap per-instance tint for crowd variety. Keyed on the STABLE entity id (carried in clipB.w),
+ * NOT the draw-local gl_InstanceIndex: the unified LOD field compacts entities into per-frame
+ * near/far buffers whose draw order shifts as the partition moves, so an index-keyed color would
+ * flicker frame to frame; the id keeps each entity one color in either tier. */
 vec3 tint(uint id) {
     return 0.45 + 0.45 * cos(vec3(float(id) * 0.91, float(id) * 1.73 + 2.0, float(id) * 2.21 + 4.0));
 }
@@ -134,6 +137,6 @@ void main() {
 #else
     mat3 m3 = mat3(inst.model);
     vNormal = normalize(m3 * nrmAccum);
-    vColor = tint(uint(gl_InstanceIndex));
+    vColor = tint(inst.clipB.w);
 #endif
 }

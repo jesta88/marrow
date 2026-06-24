@@ -13,7 +13,7 @@
 typedef struct {
     float    model[16];
     uint32_t clipA[4];   /* first_frame, frame_count, looping, paletteIndex */
-    uint32_t clipB[4];   /* first_frame, frame_count, looping, _pad         */
+    uint32_t clipB[4];   /* first_frame, frame_count, looping, entity id (drives the stable tint) */
     float    times[4];   /* tA, tB, durA, durB                              */
     float    blend[4];   /* w, _, _, _                                      */
 } InstanceAnim;

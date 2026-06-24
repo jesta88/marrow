@@ -83,6 +83,7 @@ add_executable(marrow_demo
   crowd.c
   crowd_cpu.c
   heroes.c
+  field.c
   jobs.c
   validate.c
   profiler.c

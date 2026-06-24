@@ -26,7 +26,7 @@ _Static_assert(sizeof(StbVert) == 16, "stb_easy_font vertex is 16 bytes");
 #define HUD_GRAPH_TGT   33.34f   /* ms at full bar height (30 fps line) */
 
 static const char *k_cpu_name[PROF_CPU_COUNT] = {
-    "wait", "acquire", "crowd", "heroes", "palette_gen", "upload", "record", "submit"
+    "wait", "acquire", "crowd", "heroes", "palette_gen", "upload", "record", "submit", "lod"
 };
 static const char *k_gpu_name[PROF_GPU_COUNT] = { "frame", "ground", "crowd", "heroes", "hud" };
 
@@ -162,6 +162,12 @@ void hud_draw(Hud *h, VkCtx *ctx, VkCommandBuffer cmd, VkExtent2D extent, const 
     LINE(dim, "inst %llu  draws %llu  tris %.2fM  bones %.2fM",
          (unsigned long long)prof->instances, (unsigned long long)prof->draws,
          (double)prof->triangles * 1e-6, (double)prof->bones * 1e-6);
+    if (prof->field_r_a > 0.0f) {
+        LINE(gold, "LOD  near(A) %u  far(B) %u  R_A %.0f  lod %.3f ms",
+             prof->field_near, prof->field_far, (double)prof->field_r_a, prof->cpu[PROF_LOD].ema);
+        if (prof->field_clamped)
+            LINE(gold, "  near-cap clamp: %u entities exceed near_cap -> Tier B", prof->field_clamped);
+    }
 
     if (h->detail) {
         LINE(gold, "-- CPU scopes (ms, EMA) --");
@@ -173,7 +179,10 @@ void hud_draw(Hud *h, VkCtx *ctx, VkCommandBuffer cmd, VkExtent2D extent, const 
                 LINE(dim, "  %-12s %.3f", k_gpu_name[z], prof->gpu[z].ema);
         }
     }
-    LINE(dim, "F1 hud  F2 detail  M model  T tier  B/123 backend  J jobs  H f16  -/= count  R reset  P promote");
+    if (prof->field_r_a > 0.0f)
+        LINE(dim, "F1 hud  F2 detail  M model  -/= count  [ ] R_A  R reset");
+    else
+        LINE(dim, "F1 hud  F2 detail  M model  T tier  B/123 backend  J jobs  H f16  -/= count  R reset  P promote");
     #undef LINE
 
     /* ---- panel + text + graph geometry ---- */

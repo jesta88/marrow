@@ -30,6 +30,7 @@ typedef enum {
     PROF_PALETTE_UPLOAD,    /* memcpy scratch -> mapped GPU SSBO (write-combined)            */
     PROF_RECORD,            /* command-buffer recording                                      */
     PROF_SUBMIT,            /* vkc_end_frame submit + present                                */
+    PROF_LOD,               /* unified field: distance partition + top-K + clip-pair compaction */
     PROF_CPU_COUNT
 } prof_cpu_zone;
 
@@ -79,6 +80,11 @@ typedef struct {
 
     /* counters set by the render loop */
     uint64_t  instances, draws, triangles, bones;
+    /* unified-field LOD split (field_r_a > 0 only in the field scene; 0 marks "not the field").
+     * field_clamped > 0 means more than near_cap entities fell inside R_A, so the surplus rendered
+     * Tier B this frame (the bounded, honest near-cap fallback). */
+    uint32_t  field_near, field_far, field_clamped;
+    float     field_r_a;
     uint64_t  gen_bones;                  /* bone-instances the PALETTE_GEN kernel covered this frame
                                              (cpu-crowd count x joints); 0 on the GPU tier. Lets the HUD
                                              report scale-invariant ns/(instance.bone) without the

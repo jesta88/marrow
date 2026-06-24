@@ -235,7 +235,7 @@ void heroes_update(Heroes *h, float dt, uint32_t frame) {
         InstanceAnim *tb = &((InstanceAnim *)h->tierb_map[frame])[i];
         memcpy(tb->model, model.m, sizeof model.m);
         tb->clipA[0] = h->wb_first; tb->clipA[1] = h->wb_count; tb->clipA[2] = h->wb_loop; tb->clipA[3] = 0;
-        tb->clipB[0] = h->rb_first; tb->clipB[1] = h->rb_count; tb->clipB[2] = h->rb_loop; tb->clipB[3] = 0;
+        tb->clipB[0] = h->rb_first; tb->clipB[1] = h->rb_count; tb->clipB[2] = h->rb_loop; tb->clipB[3] = i;  /* stable id -> tint */
         tb->times[0] = s->t; tb->times[1] = s->t; tb->times[2] = h->walk_dur; tb->times[3] = h->run_dur;
         tb->blend[0] = s->w; tb->blend[1] = tb->blend[2] = tb->blend[3] = 0.0f;
     }

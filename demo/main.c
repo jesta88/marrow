@@ -1,26 +1,23 @@
 /* marrow Vulkan demo - entry point.
  *
- * Showcases the marrow animation runtime across both tiers and MEASURES it honestly:
- *   - baked GPU crowd (crowd.c) - animation sampled from the baked palette on the GPU;
- *   - CPU heroes (heroes.c) with LOD promotion (P) to the baked path;
- *   - a live CPU-batch crowd tier (crowd_cpu.c) driving the flagship mrw_batch_clip_to_palette
- *     kernel every frame on a runtime-selectable backend;
- *   - an in-window HUD (F1) with CPU/GPU per-stage timings, and a headless --bench sweep.
+ * Showcases the marrow animation runtime across both tiers and MEASURES it honestly. The interactive
+ * scene is a UNIFIED LOD FIELD (field.c): one entity field, each entity classified per frame by
+ * distance to the camera into a near CPU "Tier A" band (mrw_batch_blend_clips_to_palette - an exact
+ * local-space clip cross-fade) and a far baked-GPU "Tier B" crowd (crowd.c) - the SAME animation,
+ * differing only by tier, which is marrow's LOD-promotion contract made visible. The headless paths
+ * measure the kernels directly:
+ *   - --bench: a GPU-baked + CPU-batch (crowd_cpu.c) sweep over counts/backends with GPU-timestamp
+ *     readback and a vertex-skinning microbenchmark;
+ *   - --validate / --validate-gpu: CPU parity gates (scalar vs SSE2/AVX2, jobified, f16) + GPU skin.
+ * An in-window HUD (F1) shows per-stage CPU/GPU timings and the live LOD split.
  *
  * Controls: WASD/Q/E fly, hold right-mouse to look, Shift sprint, Esc quit.
  *           M cycle model (procedural biped + every baked model in the assets folder),
- *           P promote heroes (CPU <-> baked GPU), T toggle crowd tier (GPU <-> CPU),
- *           K toggle crowd skeleton render LOD (bone lines vs skinned mesh, GPU-baked tier),
- *           B cycle CPU backend (scalar/SSE2/AVX2), 1/2/3 pick backend directly,
- *           J toggle multithreaded CPU-batch (palette-gen across cores),
- *           H toggle CPU-batch palette f32 <-> f16 (half the write/upload/fetch),
- *           -/= halve/double the live entity count, R reset perf stats,
- *           F1 toggle HUD, F2 HUD detail.
- * Flags: --count N, --promote, --crowd-tier {gpu|cpu}, --crowd-f16 (CPU tier, f16 palette),
- *        --skeleton (draw the GPU-baked crowd as bone lines),
+ *           -/= halve/double the live entity count, [ / ] shrink/grow the Tier-A radius R_A,
+ *           R reset perf stats, F1 toggle HUD, F2 HUD detail.
+ * Flags: --count N, --lod-range R_A[,R_mesh],
  *        --frames N, --screenshot PATH, --validate, --validate-gpu,
  *        --bench [--bench-out FILE] [--smoke], --selftest-assets, --cycle-models,
- *        --showcase (CPU additive/mask/aim/two-bone-IK scene on the biped),
  *        --gltf PATH [--mrw PATH]. */
 #include <volk.h>
 
@@ -41,6 +38,7 @@
 #include "crowd.h"
 #include "crowd_cpu.h"
 #include "heroes.h"
+#include "field.h"
 #include "hud.h"
 #include "jobs.h"
 #include "profiler.h"
@@ -201,6 +199,70 @@ static int scene_frame(Scene *s, Camera *cam, float dt, int tier,
     }
 
     if (draw_hud) hud_draw(s->hud, ctx, cmd, extent, prof);   /* brackets its own HUD GPU zone */
+    prof_end(prof, PROF_RECORD);
+
+    prof_begin(prof, PROF_SUBMIT);
+    vkc_end_frame(ctx);
+    prof_end(prof, PROF_SUBMIT);
+
+    prof_frame_end(prof);
+    return 1;
+}
+
+/* Interactive frame for the unified LOD field. Maps near=Tier-A onto the HEROES GPU zone and
+ * far=Tier-B onto the CROWD GPU zone so the existing HUD zone labels still read sensibly. This is the
+ * live scene only; --bench / --validate keep their own paths (which still drive crowd + ccpu). */
+static int field_frame(VkCtx *ctx, Profiler *prof, Ground *ground, Field *field, Hud *hud,
+                       Camera *cam, float dt, const char *model, int draw_hud) {
+    VkCommandBuffer cmd; VkExtent2D extent;
+    if (!vkc_begin_frame(ctx, &cmd, &extent)) return 0;
+
+    prof_add_cpu(prof, PROF_WAIT_THROTTLE, ctx->wait_ms);
+    prof_add_cpu(prof, PROF_ACQUIRE, ctx->acquire_ms);
+    float gms[VKC_GPU_ZONE_COUNT];
+    uint32_t gmask = vkc_gpu_results_ms(ctx, gms);
+    for (uint32_t z = 0; z < VKC_GPU_ZONE_COUNT; ++z)
+        if (gmask & (1u << z)) prof_add_gpu(prof, (prof_gpu_zone)z, gms[z]);
+
+    float cam_pos[3] = { cam->pos.x, cam->pos.y, cam->pos.z };
+    field_update(field, cam_pos, dt, ctx->cur_frame, prof);
+
+    float aspect = (float)extent.width / (float)extent.height;
+    mat4 view_proj = camera_view_proj(cam, aspect);
+
+    /* Publish counters BEFORE recording so the HUD reads THIS frame's split. P1 draws every entity as
+     * a skinned mesh (the skeleton render LOD lands later), so triangles/bones cover the whole field;
+     * the batched-blend kernel (PALETTE_GEN) only touches the near set, so gen_bones is near-only. */
+    const SharedMesh *mesh = field->crowd->mesh;
+    uint64_t inst = field->count;
+    uint64_t tris_per = mesh->index_count / 3;
+    prof->instances  = inst;
+    prof->triangles  = tris_per * inst + 2;            /* + ground quad */
+    prof->bones      = (uint64_t)field->joint_count * inst;
+    prof->gen_bones  = (uint64_t)field->joint_count * field->near_count;
+    prof->draws      = 1u + (field->far_count ? 1u : 0u) + (field->near_count ? 1u : 0u) + (draw_hud ? 1u : 0u);
+    prof->tier       = "field";
+    prof->backend    = field->backend_name;
+    prof->model      = model;
+    prof->field_near    = field->near_count;
+    prof->field_far     = field->far_count;
+    prof->field_clamped = field->near_clamped;
+    prof->field_r_a     = field->lod.r_a;
+
+    prof_begin(prof, PROF_RECORD);
+    vkc_gpu_zone_begin(ctx, cmd, VKC_GPU_ZONE_GROUND);
+    ground_draw(ground, ctx, cmd, &view_proj, extent);
+    vkc_gpu_zone_end(ctx, cmd, VKC_GPU_ZONE_GROUND);
+
+    vkc_gpu_zone_begin(ctx, cmd, VKC_GPU_ZONE_CROWD);   /* far Tier-B band */
+    field_draw_far(field, ctx, cmd, &view_proj, extent);
+    vkc_gpu_zone_end(ctx, cmd, VKC_GPU_ZONE_CROWD);
+
+    vkc_gpu_zone_begin(ctx, cmd, VKC_GPU_ZONE_HEROES);  /* near Tier-A band */
+    field_draw_near(field, ctx, cmd, &view_proj, extent);
+    vkc_gpu_zone_end(ctx, cmd, VKC_GPU_ZONE_HEROES);
+
+    if (draw_hud) hud_draw(hud, ctx, cmd, extent, prof);
     prof_end(prof, PROF_RECORD);
 
     prof_begin(prof, PROF_SUBMIT);
@@ -521,79 +583,85 @@ static uint32_t count_step(uint32_t c, int up, uint32_t cap) {
     return n;
 }
 
-/* ------------------------------------------------------------------ per-model GPU resources
- * Everything that depends on the loaded character - the .mrw assets, the shared skinned mesh, and
- * the three skinning paths (baked GPU crowd, CPU-batch crowd, CPU heroes). Bundled so the M-key
- * model switch can tear it all down and rebuild it for the next model while the device-, window-,
- * ground-, HUD-, and job-pool-level state lives on. */
-#define DEMO_HERO_COUNT 14u
+/* ------------------------------------------------------------------ per-model field resources
+ * Everything that depends on the loaded character for the interactive field scene: the .mrw assets,
+ * the shared skinned mesh, the borrowed Crowd (Tier-B draw machinery), and the unified LOD field.
+ * Bundled so the M-key model switch can tear it all down and rebuild it for the next character while
+ * the device-, window-, ground-, and HUD-level state lives on. (--bench / --validate build their own
+ * crowd + ccpu directly and never touch this.) */
+#define FIELD_TOTAL_CAP 65536u   /* Tier B has no 16k cap, so the field scales well past CROWD_CPU_MAX */
+#define FIELD_NEAR_CAP   8192u   /* nearest Tier-A (CPU) entities; the rest fall back to Tier B        */
 
 typedef struct {
     ProcAssets assets;
     SharedMesh mesh;
-    Crowd      crowd; int have_crowd;   /* crowd absent when the rig has no BAKED section */
-    CrowdCpu   ccpu;
-    Heroes     heroes;
-} ModelGpu;
+    Crowd      crowd;   /* borrowed by the field for the Tier-B draw machinery + the shared mesh */
+    Field      field;
+} FieldModel;
 
 static int load_assets(const ModelSource *src, ProcAssets *out) {
     if (src->kind == MODEL_PROCEDURAL) return assets_proc_build(out);
     return assets_gltf_build(src->mrw, src->gltf, out);
 }
 
-static void model_gpu_destroy(ModelGpu *m, VkCtx *ctx) {
-    /* heroes + ccpu hold marrow views that borrow assets->blob, so free assets last. */
-    heroes_destroy(&m->heroes, ctx);
-    crowd_cpu_destroy(&m->ccpu, ctx);
-    if (m->have_crowd) crowd_destroy(&m->crowd, ctx);
+static void field_model_destroy(FieldModel *m, VkCtx *ctx) {
+    /* field + crowd hold marrow views that borrow assets->blob, so free assets last. */
+    field_destroy(&m->field, ctx);
+    crowd_destroy(&m->crowd, ctx);
     shared_mesh_destroy(&m->mesh, ctx);
     assets_proc_free(&m->assets);
     memset(m, 0, sizeof *m);
 }
 
-/* Build all model-dependent resources for `src`. Returns 0 with nothing leaked on failure (any
- * partially-built state is torn down). `pool` is borrowed; `crowd_f16` selects the CPU tier format. */
-static int model_gpu_load(ModelGpu *m, VkCtx *ctx, const ModelSource *src,
-                          uint32_t capacity, uint32_t count, int crowd_f16, Jobs *pool) {
+/* Build the field-scene resources for `src`. Returns 0 with nothing leaked on failure. The character
+ * MUST have a BAKED (Tier-B) section - the field's far tier needs it. */
+static int field_model_load(FieldModel *m, VkCtx *ctx, const ModelSource *src,
+                            uint32_t count, FieldLod lod) {
     memset(m, 0, sizeof *m);
     if (load_assets(src, &m->assets) != 0) {
         fprintf(stderr, "[demo] asset load failed for '%s'\n", src->name); return 0;
+    }
+    if (!m->assets.tier_b_eligible) {
+        fprintf(stderr, "[demo] '%s' has no Tier-B (BAKED) section - the field scene needs it\n", src->name);
+        assets_proc_free(&m->assets); return 0;
     }
     if (!shared_mesh_init(&m->mesh, ctx, &m->assets)) {
         fprintf(stderr, "[demo] shared mesh init failed\n");
         assets_proc_free(&m->assets); return 0;
     }
-    if (m->assets.tier_b_eligible && crowd_init(&m->crowd, ctx, &m->assets, &m->mesh, capacity, count))
-        m->have_crowd = 1;
-    if (!crowd_cpu_init(&m->ccpu, ctx, &m->assets, &m->mesh, capacity, count)) {
-        fprintf(stderr, "[demo] cpu crowd init failed\n");
-        if (m->have_crowd) crowd_destroy(&m->crowd, ctx);
+    /* The Crowd is borrowed only for its Tier-B draw path (bindless baked palette + pipeline +
+     * crowd_draw_instances) and the shared mesh, so it is built at minimal capacity - the field owns
+     * the real far-tier InstanceAnim buffers, sized to FIELD_TOTAL_CAP. */
+    if (!crowd_init(&m->crowd, ctx, &m->assets, &m->mesh, 1u, 1u)) {
+        fprintf(stderr, "[demo] crowd (Tier-B machinery) init failed\n");
         shared_mesh_destroy(&m->mesh, ctx); assets_proc_free(&m->assets); return 0;
     }
-    if (crowd_f16) crowd_cpu_set_f16(&m->ccpu, 1);
-    if (pool) crowd_cpu_set_jobs(&m->ccpu, pool);
-    if (!heroes_init(&m->heroes, ctx, &m->assets, DEMO_HERO_COUNT)) {
-        fprintf(stderr, "[demo] heroes init failed\n");
-        crowd_cpu_destroy(&m->ccpu, ctx);
-        if (m->have_crowd) crowd_destroy(&m->crowd, ctx);
+    if (!field_init(&m->field, ctx, &m->assets, &m->crowd, FIELD_TOTAL_CAP, FIELD_NEAR_CAP, count, lod)) {
+        fprintf(stderr, "[demo] field init failed\n");
+        crowd_destroy(&m->crowd, ctx);
         shared_mesh_destroy(&m->mesh, ctx); assets_proc_free(&m->assets); return 0;
     }
     return 1;
 }
 
 int main(int argc, char **argv) {
-    int max_frames = 0; const char *shot = NULL; int selftest_assets = 0; uint32_t count = 1600;
-    int promote = 0, tier = 0;   /* tier: 0 = GPU-baked, 1 = CPU-batch */
-    int do_validate = 0, do_validate_gpu = 0, do_bench = 0, smoke = 0, crowd_f16 = 0, cycle_models = 0;
-    int skeleton = 0;   /* --skeleton / K: draw the GPU-baked crowd as bone lines */
+    int max_frames = 0; const char *shot = NULL; int selftest_assets = 0;
+    uint32_t count = 1600; int count_set = 0;
+    int do_validate = 0, do_validate_gpu = 0, do_bench = 0, smoke = 0, cycle_models = 0;
+    int skeleton = 0;   /* --skeleton: returns as the field's render LOD in a later step */
+    FieldLod lod = { .r_a = 35.0f, .r_mesh = 1.0e9f };   /* r_mesh huge => P1 draws the whole field as mesh */
     const char *gltf_path = NULL, *mrw_path = NULL, *bench_out = NULL;
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--frames") && i + 1 < argc) max_frames = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--screenshot") && i + 1 < argc) shot = argv[++i];
-        else if (!strcmp(argv[i], "--count") && i + 1 < argc) count = (uint32_t)strtoul(argv[++i], NULL, 10);
-        else if (!strcmp(argv[i], "--promote")) promote = 1;
-        else if (!strcmp(argv[i], "--crowd-tier") && i + 1 < argc) tier = !strcmp(argv[++i], "cpu") ? 1 : 0;
-        else if (!strcmp(argv[i], "--crowd-f16")) { crowd_f16 = 1; tier = 1; }  /* f16 is a CPU-tier path */
+        else if (!strcmp(argv[i], "--count") && i + 1 < argc) { count = (uint32_t)strtoul(argv[++i], NULL, 10); count_set = 1; }
+        else if (!strcmp(argv[i], "--lod-range") && i + 1 < argc) {
+            /* R_A[,R_mesh] (world units): the animation-tier radius and the optional render-LOD radius */
+            float ra = 0.0f, rm = 0.0f;
+            int n = sscanf(argv[++i], "%f,%f", &ra, &rm);
+            if (n >= 1 && ra > 0.0f) lod.r_a = ra;
+            if (n >= 2 && rm > 0.0f) lod.r_mesh = rm;
+        }
         else if (!strcmp(argv[i], "--validate")) do_validate = 1;
         else if (!strcmp(argv[i], "--validate-gpu")) do_validate_gpu = 1;
         else if (!strcmp(argv[i], "--bench")) do_bench = 1;
@@ -601,8 +669,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--smoke")) smoke = 1;
         else if (!strcmp(argv[i], "--selftest-assets")) selftest_assets = 1;
         else if (!strcmp(argv[i], "--cycle-models")) cycle_models = 1;  /* headless switch smoke */
-        else if (!strcmp(argv[i], "--skeleton")) skeleton = 1;          /* bone-line crowd render LOD */
-        else if (!strcmp(argv[i], "--showcase")) heroes_set_showcase(1); /* CPU pose-ops scene */
+        else if (!strcmp(argv[i], "--skeleton")) skeleton = 1;
+        else if (!strcmp(argv[i], "--showcase")) heroes_set_showcase(1); /* CPU pose-ops scene (unwired in P1) */
         else if (!strcmp(argv[i], "--gltf") && i + 1 < argc) gltf_path = argv[++i];
         else if (!strcmp(argv[i], "--mrw") && i + 1 < argc) mrw_path = argv[++i];
     }
@@ -663,8 +731,8 @@ int main(int argc, char **argv) {
         return rc;
     }
 
-    /* interactive: discover the switchable models, then build the GPU resources for the startup one
-     * (the procedural biped unless --gltf was given). M cycles through the rest. */
+    /* interactive (the unified LOD field): discover the switchable models, then build the field-scene
+     * resources for the startup one (the procedural biped unless --gltf was given). M cycles the rest. */
     ModelRegistry reg;
     int model_idx = models_discover(&reg, gltf_path ? &startup_src : NULL);
     fprintf(stderr, "[demo] %d model(s) (M cycles):", reg.count);
@@ -672,54 +740,41 @@ int main(int argc, char **argv) {
         fprintf(stderr, " %s%s", reg.items[i].name, i == model_idx ? "*" : "");
     fprintf(stderr, "\n");
 
-    /* Capacity ceiling for live count adjustment (-/=). Bounded by CROWD_CPU_MAX so the GPU-baked and
-     * CPU-batch tiers ALWAYS draw the same instance count - an honest A/B (the CPU tier is hard-capped
-     * there anyway; higher GPU-only counts are the headless --bench sweep's job). Buffers are sized to
-     * this once per model, so the knob only rebuilds the grid - it never reallocates. */
-    uint32_t capacity = CROWD_CPU_MAX;
+    /* The field's Tier B has no 16k ceiling, so the live-count knob (-/=) runs all the way to
+     * FIELD_TOTAL_CAP. Default to a count that already shows BOTH tiers (a near Tier-A band + a large
+     * far Tier-B crowd) unless --count overrode it. */
+    if (!count_set) count = 8192u;
+    uint32_t capacity = FIELD_TOTAL_CAP;
     if (count > capacity) count = capacity;
+    if (skeleton)
+        fprintf(stderr, "[demo] note: --skeleton/K returns as the field's render LOD in a later step\n");
 
-    /* Job pool for the CPU-batch tier - the demo schedules marrow's batch across cores (the runtime
-     * owns no threads). Auto-sized to the host; shared across model switches (model-independent). */
-    Jobs *pool = jobs_create(0);
-    if (pool) fprintf(stderr, "[demo] job pool: %u lanes (J toggles jobified CPU-batch)\n",
-                      jobs_worker_count(pool));
-
-    ModelGpu mg;
-    if (!model_gpu_load(&mg, &ctx, &reg.items[model_idx], capacity, count, crowd_f16, pool)) {
+    FieldModel mg;
+    if (!field_model_load(&mg, &ctx, &reg.items[model_idx], count, lod)) {
         fprintf(stderr, "model load failed\n"); return 1;
     }
-    if (!mg.have_crowd) { tier = 1; fprintf(stderr, "[demo] rig has no BAKED section - CPU-batch crowd only\n"); }
 
     Hud hud;
     if (!hud_init(&hud, &ctx)) { fprintf(stderr, "hud init failed\n"); return 1; }
 
     Profiler prof; prof_init(&prof);
-    Scene s = { .ctx = &ctx, .prof = &prof, .mesh = &mg.mesh, .ground = &ground,
-                .crowd = mg.have_crowd ? &mg.crowd : NULL, .ccpu = &mg.ccpu, .heroes = &mg.heroes,
-                .hud = &hud, .joint_count = mg.assets.joint_count, .model = reg.items[model_idx].name,
-                .skeleton = skeleton };
-
     Camera cam; camera_init(&cam, v3(0.0f, 8.0f, 40.0f), 0.0f, -0.20f);
 
     uint64_t rendered = 0;
     int cyc_seen = 1;   /* --cycle-models: models visited so far (startup counts as one) */
-    int prev_p = 0, prev_f1 = 0, prev_f2 = 0, prev_t = 0, prev_b = 0, prev_r = 0, prev_j = 0, prev_h = 0, prev_m = 0;
-    int prev_dec = 0, prev_inc = 0, prev_k1 = 0, prev_k2 = 0, prev_k3 = 0, prev_k = 0;
+    int prev_f1 = 0, prev_f2 = 0, prev_r = 0, prev_m = 0;
+    int prev_dec = 0, prev_inc = 0, prev_lb = 0, prev_rb = 0;
     double prev = prof_now_s(), last_title = prev;
     while (!glfwWindowShouldClose(win)) {
         glfwPollEvents();
         if (glfwGetKey(win, GLFW_KEY_ESCAPE) == GLFW_PRESS) glfwSetWindowShouldClose(win, 1);
-        int kp = glfwGetKey(win, GLFW_KEY_P);  if (kp == GLFW_PRESS && !prev_p) promote = !promote; prev_p = kp;
         int kf1 = glfwGetKey(win, GLFW_KEY_F1); if (kf1 == GLFW_PRESS && !prev_f1) hud.visible = !hud.visible; prev_f1 = kf1;
         int kf2 = glfwGetKey(win, GLFW_KEY_F2); if (kf2 == GLFW_PRESS && !prev_f2) hud.detail = !hud.detail; prev_f2 = kf2;
-        int kt = glfwGetKey(win, GLFW_KEY_T);
-        if (kt == GLFW_PRESS && !prev_t && mg.have_crowd) { tier = !tier; prof_reset_stats(&prof); } prev_t = kt;
 
-        /* M: cycle to the next model. Rebuilds every model-dependent resource (assets, mesh, both
-         * crowd tiers, heroes) for the new character while keeping the live count, camera, HUD, job
-         * pool, and the CPU-tier config (backend / jobs / f16). The device is idled first so the old
-         * buffers are retired before they're freed. On a load failure the previous model is restored. */
+        /* M: cycle to the next model. Rebuilds the field-scene resources (assets, mesh, borrowed crowd,
+         * field) for the new character while keeping the live count, camera, HUD, and LOD ranges. The
+         * device is idled first so the old buffers retire before they're freed; on a load failure the
+         * previous model is restored. */
         int km = glfwGetKey(win, GLFW_KEY_M);
         int want_next = (km == GLFW_PRESS && !prev_m);
         prev_m = km;
@@ -731,77 +786,39 @@ int main(int argc, char **argv) {
         }
         if (want_next && reg.count > 1) {
             int nidx = (model_idx + 1) % reg.count;
-            mrw_backend sv_backend = mg.ccpu.disp.backend;     /* survive the rebuild */
-            int sv_jobs = mg.ccpu.threaded, sv_f16 = mg.ccpu.use_f16;
             vkc_wait_idle(&ctx);
-            model_gpu_destroy(&mg, &ctx);
-            if (model_gpu_load(&mg, &ctx, &reg.items[nidx], capacity, count, sv_f16, pool)) {
+            field_model_destroy(&mg, &ctx);
+            if (field_model_load(&mg, &ctx, &reg.items[nidx], count, lod)) {
                 model_idx = nidx;
-            } else if (!model_gpu_load(&mg, &ctx, &reg.items[model_idx], capacity, count, sv_f16, pool)) {
+            } else if (!field_model_load(&mg, &ctx, &reg.items[model_idx], count, lod)) {
                 fprintf(stderr, "[demo] fatal: could not reload model '%s'\n", reg.items[model_idx].name);
                 break;
             }
-            crowd_cpu_set_backend(&mg.ccpu, sv_backend);
-            if (pool && mg.ccpu.threaded != sv_jobs) crowd_cpu_toggle_jobs(&mg.ccpu);
-            s.mesh = &mg.mesh;
-            s.crowd = mg.have_crowd ? &mg.crowd : NULL;
-            s.ccpu = &mg.ccpu;
-            s.heroes = &mg.heroes;
-            s.joint_count = mg.assets.joint_count;
-            s.model = reg.items[model_idx].name;
-            if (!mg.have_crowd) tier = 1;   /* CPU-only rig: CPU-batch crowd is the only one */
-            fprintf(stderr, "[demo] model -> %s (%u joints%s)\n", reg.items[model_idx].name,
-                    mg.assets.joint_count, mg.have_crowd ? ", Tier-B" : ", Tier-A only");
+            fprintf(stderr, "[demo] model -> %s (%u joints)\n", reg.items[model_idx].name, mg.assets.joint_count);
             prof_reset_stats(&prof);
         }
-
-        /* Backend: B cycles, 1/2/3 jump straight to scalar/SSE2/AVX2. Stats reset so the steady-state
-         * percentiles settle on the new backend without carrying the transition frames. */
-        int kb = glfwGetKey(win, GLFW_KEY_B);
-        if (kb == GLFW_PRESS && !prev_b) { crowd_cpu_cycle_backend(&mg.ccpu); prof_reset_stats(&prof); } prev_b = kb;
-        int k1 = glfwGetKey(win, GLFW_KEY_1) == GLFW_PRESS;
-        int k2 = glfwGetKey(win, GLFW_KEY_2) == GLFW_PRESS;
-        int k3 = glfwGetKey(win, GLFW_KEY_3) == GLFW_PRESS;
-        if ((k1 && !prev_k1) || (k2 && !prev_k2) || (k3 && !prev_k3)) {
-            mrw_backend want = (k3 && !prev_k3) ? MRW_BACKEND_AVX2
-                             : (k2 && !prev_k2) ? MRW_BACKEND_SSE2 : MRW_BACKEND_SCALAR;
-            crowd_cpu_set_backend(&mg.ccpu, want); prof_reset_stats(&prof);
-        }
-        prev_k1 = k1; prev_k2 = k2; prev_k3 = k3;
 
         int kr = glfwGetKey(win, GLFW_KEY_R);
         if (kr == GLFW_PRESS && !prev_r) prof_reset_stats(&prof); prev_r = kr;
 
-        /* J: fan the CPU-batch palette-gen across the job pool (or back to single-threaded). */
-        int kj = glfwGetKey(win, GLFW_KEY_J);
-        if (kj == GLFW_PRESS && !prev_j) { crowd_cpu_toggle_jobs(&mg.ccpu); prof_reset_stats(&prof); } prev_j = kj;
+        /* [ / ]: shrink / grow the animation-tier radius R_A - how deep the near Tier-A band reaches.
+         * Mutated in place on the live field; the next partition picks it up. */
+        int klb = glfwGetKey(win, GLFW_KEY_LEFT_BRACKET) == GLFW_PRESS;
+        int krb = glfwGetKey(win, GLFW_KEY_RIGHT_BRACKET) == GLFW_PRESS;
+        if (klb && !prev_lb) { mg.field.lod.r_a = mg.field.lod.r_a > 10.0f ? mg.field.lod.r_a - 5.0f : 5.0f; prof_reset_stats(&prof); }
+        if (krb && !prev_rb) { mg.field.lod.r_a += 5.0f; prof_reset_stats(&prof); }
+        prev_lb = klb; prev_rb = krb;
 
-        /* H: flip the CPU-batch palette between f32 and f16 - half the write/upload/fetch. */
-        int kh = glfwGetKey(win, GLFW_KEY_H);
-        if (kh == GLFW_PRESS && !prev_h) { crowd_cpu_toggle_f16(&mg.ccpu); prof_reset_stats(&prof); } prev_h = kh;
-
-        /* K: draw the GPU-baked crowd as a bone-line skeleton instead of the skinned mesh - the cheap
-         * render LOD that keeps the frame-time bar green at high counts (animation cost is unchanged). */
-        int kk = glfwGetKey(win, GLFW_KEY_K);
-        if (kk == GLFW_PRESS && !prev_k) { skeleton = !skeleton; prof_reset_stats(&prof); } prev_k = kk;
-        s.skeleton = skeleton;
-
-        /* Live entity count: '-' halves, '=' (or numpad +/-) doubles. Buffers are capacity-sized, so
-         * this only rebuilds the grid + re-uploads - no reallocation. Idle first since the CPU tier's
-         * static instance buffer is rewritten in place. */
+        /* Live entity count: '-' halves, '=' (or numpad +/-) doubles, up to FIELD_TOTAL_CAP. Buffers
+         * are capacity-sized, so this only re-lays-out the grid (CPU) - no reallocation, no device
+         * idle (the per-frame near/far buffers are re-staged by the next field_update). */
         int kdec = glfwGetKey(win, GLFW_KEY_MINUS) == GLFW_PRESS || glfwGetKey(win, GLFW_KEY_KP_SUBTRACT) == GLFW_PRESS;
         int kinc = glfwGetKey(win, GLFW_KEY_EQUAL) == GLFW_PRESS || glfwGetKey(win, GLFW_KEY_KP_ADD) == GLFW_PRESS;
         int dec = kdec && !prev_dec, inc = kinc && !prev_inc;
         prev_dec = kdec; prev_inc = kinc;
         if (dec || inc) {
             uint32_t nc = count_step(count, inc, capacity);
-            if (nc != count) {
-                count = nc;
-                vkc_wait_idle(&ctx);
-                if (mg.have_crowd) crowd_set_count(&mg.crowd, count);
-                crowd_cpu_set_count(&mg.ccpu, count);
-                prof_reset_stats(&prof);
-            }
+            if (nc != count) { count = nc; field_set_count(&mg.field, count); prof_reset_stats(&prof); }
         }
 
         double now = prof_now_s();
@@ -810,7 +827,7 @@ int main(int argc, char **argv) {
 
         if (shot && rendered == (uint64_t)capture_frame) vkc_request_screenshot(&ctx, shot);
 
-        if (!scene_frame(&s, &cam, dt, tier, promote, 1, 1)) continue;
+        if (!field_frame(&ctx, &prof, &ground, &mg.field, &hud, &cam, dt, reg.items[model_idx].name, 1)) continue;
         rendered++;
 
         if (now - last_title >= 1.0) {
@@ -822,9 +839,8 @@ int main(int argc, char **argv) {
     }
 
     vkc_wait_idle(&ctx);
-    jobs_destroy(pool);   /* no in-flight gen after the loop; ccpu owns its scratch, not the pool */
     hud_destroy(&hud, &ctx);
-    model_gpu_destroy(&mg, &ctx);   /* assets, mesh, both crowd tiers, heroes */
+    field_model_destroy(&mg, &ctx);   /* field, borrowed crowd, mesh, assets */
     ground_destroy(&ground, &ctx);
     vkc_destroy(&ctx);
     glfwDestroyWindow(win);

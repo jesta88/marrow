@@ -193,6 +193,7 @@ static void init_instances(Crowd *cr) {
         a->clipA[1] = cr->clips[clip].frame_count;
         a->clipA[2] = cr->clips[clip].looping;
         a->clipA[3] = 0;                              /* palette index 0 */
+        a->clipB[3] = i;                              /* stable entity id -> tint (crowd.vert) */
         a->times[0] = fmodf((float)i * 0.137f, cr->clips[clip].duration);
         a->times[2] = cr->clips[clip].duration;
         a->blend[0] = 0.0f;                           /* single clip (steady state) */
