@@ -53,6 +53,12 @@ typedef struct {
     VkPipelineLayout layout;
     VkShaderEXT vs, fs;
     VkShaderEXT vs_skin_bench, vs_static_bench;   /* bench-only vertex-skinning microbench VS variants */
+    VkShaderEXT vs_skel, fs_skel;                 /* bone-line skeleton render LOD (LINE_LIST) */
+
+    /* Static bone-line geometry: two endpoints per non-root joint, each {joint, bind-model origin}.
+     * Shared across all instances via the instanced draw; posed on the GPU from the baked palette. */
+    VkBuffer skel_vbuf; VkDeviceMemory skel_vmem;
+    uint32_t skel_vert_count;
 
     const SharedMesh *mesh;   /* borrowed; owned by main */
 
@@ -87,6 +93,11 @@ void crowd_draw(Crowd *cr, VkCtx *ctx, VkCommandBuffer cmd, const mat4 *view_pro
 void crowd_draw_instances(Crowd *cr, VkCtx *ctx, VkCommandBuffer cmd, const mat4 *view_proj,
                           VkExtent2D extent, VkDeviceAddress inst_addr, uint32_t count,
                           CrowdDrawMode mode);
+/* Draw `count` instances as bone-line skeletons from an arbitrary InstanceAnim buffer: a LINE_LIST
+ * over the static bone geometry, each endpoint posed by its joint's baked palette row. The cheap
+ * render LOD - per-vertex skinning cost drops to ~2x bones while the animation cost is unchanged. */
+void crowd_draw_skeleton(Crowd *cr, VkCtx *ctx, VkCommandBuffer cmd, const mat4 *view_proj,
+                         VkExtent2D extent, VkDeviceAddress inst_addr, uint32_t count);
 void crowd_destroy(Crowd *cr, VkCtx *ctx);
 
 #endif /* DEMO_CROWD_H */

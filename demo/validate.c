@@ -39,6 +39,27 @@ static int find_baked(const mrw_blob *b, mrw_baked_view *out) {
     }
     return 0;
 }
+
+/* Bind-model-space origin of a joint = translation of inverse(inverse_bind) (a 3x4 affine [R|t],
+ * row-major; inverse translation = -R^-1.t). The skeleton render LOD keys each bone endpoint on this;
+ * mirrors crowd.c's bind_origin_from_inverse_bind so check (8) validates that exact formula against
+ * the independent model_pose origin. */
+static void bind_origin_from_inverse_bind(const float ib[12], float out[3]) {
+    float a = ib[0], b = ib[1], c = ib[2];
+    float d = ib[4], e = ib[5], f = ib[6];
+    float g = ib[8], h = ib[9], i = ib[10];
+    float A = (e*i - f*h), B = -(d*i - f*g), C = (d*h - e*g);
+    float det = a*A + b*B + c*C;
+    float s = det != 0.0f ? 1.0f / det : 0.0f;
+    float r00 = A*s,            r01 = -(b*i - c*h)*s, r02 =  (b*f - c*e)*s;
+    float r10 = B*s,            r11 =  (a*i - c*g)*s, r12 = -(a*f - c*d)*s;
+    float r20 = C*s,            r21 = -(a*h - b*g)*s, r22 =  (a*e - b*d)*s;
+    float tx = ib[3], ty = ib[7], tz = ib[11];
+    out[0] = -(r00*tx + r01*ty + r02*tz);
+    out[1] = -(r10*tx + r11*ty + r12*tz);
+    out[2] = -(r20*tx + r21*ty + r22*tz);
+}
+
 static int find_clip(const ProcAssets *a, const char *name, const mrw_blob *blob,
                      mrw_clip_view *out, uint32_t *clip_index) {
     for (uint32_t i = 0; i < a->clip_count; ++i)
@@ -137,8 +158,75 @@ int validate_run(const ProcAssets *assets, uint32_t bench_n) {
     /* (7) f16 PALETTE PARITY: decode the f16 palette and check it against the f32 palette. */
     if (validate_cpu_crowd_f16(assets) != 0) rc = 1;
 
+    /* (8) SKELETON JOINT ORIGINS: the bone-line render LOD poses each joint origin as
+     * M_joint . bind_origin; assert it equals the independent model_pose origin (Tier-A exact,
+     * Tier-B sub-mm at a baked frame). */
+    if (validate_skeleton_origins(assets) != 0) rc = 1;
+
     fprintf(stderr, "=== validation %s ===\n\n", rc == 0 ? "PASS" : "FAIL");
     return rc;
+}
+
+/* ------------------------------------------------------------------ skeleton joint-origin parity */
+
+int validate_skeleton_origins(const ProcAssets *assets) {
+    mrw_blob blob;
+    if (mrw_blob_open(assets->blob, assets->blob_size, &blob) != MRW_OK) return 1;
+    mrw_skeleton_view skel; mrw_blob_skeleton(&blob, &skel);
+    mrw_baked_view bv; if (!find_baked(&blob, &bv)) { fprintf(stderr, "(8) skel-origins: no BAKED section\n"); return 1; }
+    mrw_clip_view walk; uint32_t walk_ci;
+    if (!find_clip(assets, "walk", &blob, &walk, &walk_ci)) { fprintf(stderr, "(8) skel-origins: no walk clip\n"); return 1; }
+    mrw_baked_clip we; mrw_baked_clip_entry(&bv, walk_ci, &we);
+
+    uint32_t jc = skel.joint_count;
+    float dur = we.source_duration_s;
+    float t = (1.0f / (float)(we.frame_count - 1)) * dur;   /* baked frame 1 (exact-at-frame) */
+
+    mrw_trs *locals = (mrw_trs *)mrw_authoring_alloc((size_t)jc * sizeof(mrw_trs));
+    float   *model  = (float *)mrw_authoring_alloc((size_t)jc * 12 * sizeof(float));
+    float   *palA   = (float *)mrw_authoring_alloc((size_t)jc * 12 * sizeof(float));
+    if (!locals || !model || !palA) {
+        mrw_authoring_free(locals); mrw_authoring_free(model); mrw_authoring_free(palA); return 1;
+    }
+
+    /* truth + Tier-A skinning palette from the CPU pose pipeline */
+    mrw_clip_sample_local(&walk, t, locals, jc);
+    mrw_local_to_model(&skel, locals, model, jc);
+    mrw_model_to_palette(&skel, model, palA, jc);
+
+    double max_a = 0.0, max_b = 0.0;
+    for (uint32_t j = 0; j < jc; ++j) {
+        float ib[12]; mrw_skeleton_inverse_bind(&skel, j, ib);
+        float o[3];   bind_origin_from_inverse_bind(ib, o);
+        /* truth: posed joint origin = translation of model_pose(j) */
+        float truth[3] = { model[j*12+3], model[j*12+7], model[j*12+11] };
+        /* Tier-A: the canonical skinning palette row M = model_pose . inverse_bind applied to the
+         * bind origin (algebraically exact - inverse_bind cancels bind_model) */
+        const float *MA = &palA[j*12];
+        float pa[3] = { MA[0]*o[0]+MA[1]*o[1]+MA[2]*o[2]+MA[3],
+                        MA[4]*o[0]+MA[5]*o[1]+MA[6]*o[2]+MA[7],
+                        MA[8]*o[0]+MA[9]*o[1]+MA[10]*o[2]+MA[11] };
+        /* Tier-B: the baked component-space bone applied to the same bind origin (what crowd_skel.vert
+         * computes); equals truth within half-float at a baked frame */
+        float MB[12]; mrw_baked_sample_bone(&bv, walk_ci, j, t, MB);
+        float pb[3] = { MB[0]*o[0]+MB[1]*o[1]+MB[2]*o[2]+MB[3],
+                        MB[4]*o[0]+MB[5]*o[1]+MB[6]*o[2]+MB[7],
+                        MB[8]*o[0]+MB[9]*o[1]+MB[10]*o[2]+MB[11] };
+        double da = sqrt((double)(pa[0]-truth[0])*(pa[0]-truth[0]) + (pa[1]-truth[1])*(pa[1]-truth[1]) + (pa[2]-truth[2])*(pa[2]-truth[2])) * 1000.0;
+        double db = sqrt((double)(pb[0]-truth[0])*(pb[0]-truth[0]) + (pb[1]-truth[1])*(pb[1]-truth[1]) + (pb[2]-truth[2])*(pb[2]-truth[2])) * 1000.0;
+        if (da > max_a) max_a = da;
+        if (db > max_b) max_b = db;
+    }
+    /* Tier-A is algebraically exact (f32 round-off only). Tier-B is the f16-decoded baked bone
+     * applied to the bind-model origin, so its error is half-float quantization amplified by the
+     * origin's lever arm - a few mm at full character scale (~2 m), the same RGBA16F decode gap
+     * check (1) reports. A real decode/layout bug would be cm-to-metres, far outside this. */
+    int pass = max_a < 1e-3 && max_b < 5.0;
+    fprintf(stderr, "(8) skeleton joint origins (%u joints, baked frame) : TierA %.6f mm, TierB %.4f mm (f16)  -> %s\n",
+            jc, max_a, max_b, pass ? "PASS" : "FAIL");
+
+    mrw_authoring_free(locals); mrw_authoring_free(model); mrw_authoring_free(palA);
+    return pass ? 0 : 1;
 }
 
 /* ------------------------------------------------------------------ shared CPU microbench */

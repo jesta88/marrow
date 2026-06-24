@@ -31,6 +31,12 @@ _Static_assert(sizeof(CrowdPush) == 80, "CrowdPush must be 80 bytes");
 #include "crowd_frag.spv.h"
 #include "crowd_skin_bench_vert.spv.h"      /* crowd.vert built with -DMARROW_BENCH */
 #include "crowd_static_bench_vert.spv.h"
+#include "crowd_skel_vert.spv.h"            /* bone-line skeleton render LOD */
+#include "skel_frag.spv.h"
+
+/* One endpoint of a bone line: the joint whose baked palette row poses it, and the joint's
+ * bind-model-space origin. Posed on the GPU as M_joint . origin (crowd_skel.vert). 16 bytes. */
+typedef struct { uint32_t joint; float origin[3]; } SkelVertex;
 
 static int find_baked(const mrw_blob *b, mrw_baked_view *out) {
     for (uint32_t i = 0; i < b->section_count; ++i) {
@@ -65,6 +71,64 @@ void shared_mesh_destroy(SharedMesh *m, VkCtx *ctx) {
     vkc_destroy_buffer(ctx, m->vbuf, m->vmem);
     vkc_destroy_buffer(ctx, m->ibuf, m->imem);
     memset(m, 0, sizeof *m);
+}
+
+/* ------------------------------------------------------------------ bone-line skeleton geometry */
+
+/* Bind-model-space origin of a joint = translation of inverse(inverse_bind). The canonical skinning
+ * palette is M = model_pose . inverse_bind, so M . bind_origin = model_pose . 0 = the posed joint
+ * origin (inverse_bind cancels bind_model). Holds for any rig, including an identity inverse-bind
+ * (then bind_origin is 0 and M . 0 is still the joint origin). inverse_bind is a 3x4 affine [R|t]
+ * row-major; the inverse translation is -R^-1 . t. */
+static void bind_origin_from_inverse_bind(const float ib[12], float out[3]) {
+    float a = ib[0], b = ib[1], c = ib[2];
+    float d = ib[4], e = ib[5], f = ib[6];
+    float g = ib[8], h = ib[9], i = ib[10];
+    float A = (e*i - f*h), B = -(d*i - f*g), C = (d*h - e*g);
+    float det = a*A + b*B + c*C;
+    float s = det != 0.0f ? 1.0f / det : 0.0f;
+    /* rows of R^-1 = adjugate^T / det */
+    float r00 = A*s,            r01 = -(b*i - c*h)*s, r02 =  (b*f - c*e)*s;
+    float r10 = B*s,            r11 =  (a*i - c*g)*s, r12 = -(a*f - c*d)*s;
+    float r20 = C*s,            r21 = -(a*h - b*g)*s, r22 =  (a*e - b*d)*s;
+    float tx = ib[3], ty = ib[7], tz = ib[11];
+    out[0] = -(r00*tx + r01*ty + r02*tz);
+    out[1] = -(r10*tx + r11*ty + r12*tz);
+    out[2] = -(r20*tx + r21*ty + r22*tz);
+}
+
+/* Build the static line VB: one LINE_LIST segment (two endpoints) per non-root joint, joint->parent.
+ * Geometry is shared by every instance; only the per-instance palette row differs at draw time. */
+static int build_skeleton_vb(Crowd *cr, VkCtx *ctx, const mrw_skeleton_view *skel) {
+    uint32_t jc = skel->joint_count;
+    float *org = (float *)malloc((size_t)jc * 3 * sizeof(float));
+    SkelVertex *v = (SkelVertex *)malloc((size_t)jc * 2 * sizeof(SkelVertex));  /* <= 2 per joint */
+    if (!org || !v) { free(org); free(v); return 0; }
+
+    for (uint32_t j = 0; j < jc; ++j) {
+        float ib[12];
+        mrw_skeleton_inverse_bind(skel, j, ib);
+        bind_origin_from_inverse_bind(ib, &org[j * 3]);
+    }
+    uint32_t n = 0;
+    for (uint32_t j = 0; j < jc; ++j) {
+        uint16_t p = 0xFFFF;
+        mrw_skeleton_parent(skel, j, &p);
+        if (p == 0xFFFFu) continue;   /* root has no bone segment */
+        v[n].joint = j; memcpy(v[n].origin, &org[(size_t)j * 3], 3 * sizeof(float)); n++;
+        v[n].joint = p; memcpy(v[n].origin, &org[(size_t)p * 3], 3 * sizeof(float)); n++;
+    }
+    free(org);
+    cr->skel_vert_count = n;
+    if (n == 0) { free(v); return 1; }   /* single-joint rig: no bones; draw becomes a no-op */
+
+    void *map;
+    VkDeviceSize bytes = (VkDeviceSize)n * sizeof(SkelVertex);
+    if (!vkc_create_host_buffer(ctx, bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                                &cr->skel_vbuf, &cr->skel_vmem, &map)) { free(v); return 0; }
+    memcpy(map, v, (size_t)bytes);
+    free(v);
+    return 1;
 }
 
 static int create_bindless(Crowd *cr, VkCtx *ctx) {
@@ -201,6 +265,14 @@ int crowd_init(Crowd *cr, VkCtx *ctx, const ProcAssets *assets, const SharedMesh
     if (!vkc_create_vertex_shader(ctx, crowd_static_bench_vert_spv, sizeof crowd_static_bench_vert_spv,
             &cr->set_layout, 1, &pr, &cr->vs_static_bench)) goto fail;
 
+    /* bone-line skeleton render LOD: static line geometry + a VS/FS pair sharing this layout + the
+     * bindless palette set (the skeleton poses from the same baked palette the mesh skins from). */
+    mrw_skeleton_view skel;
+    if (mrw_blob_skeleton(&blob, &skel) != MRW_OK) { fprintf(stderr, "[crowd] no SKELETON section\n"); goto fail; }
+    if (!build_skeleton_vb(cr, ctx, &skel)) { fprintf(stderr, "[crowd] skeleton VB build failed\n"); goto fail; }
+    if (!vkc_create_graphics_shaders(ctx, crowd_skel_vert_spv, sizeof crowd_skel_vert_spv,
+            skel_frag_spv, sizeof skel_frag_spv, &cr->set_layout, 1, &pr, &cr->vs_skel, &cr->fs_skel)) goto fail;
+
     fprintf(stderr, "[crowd] %u instances (capacity %u)\n", count, capacity);
     return 1;
 fail:   /* unwind every partially-created Vulkan resource (crowd_destroy is guarded + idempotent) */
@@ -263,10 +335,41 @@ void crowd_draw_instances(Crowd *cr, VkCtx *ctx, VkCommandBuffer cmd, const mat4
     vkCmdDrawIndexed(cmd, cr->mesh->index_count, count, 0, 0, 0);
 }
 
+void crowd_draw_skeleton(Crowd *cr, VkCtx *ctx, VkCommandBuffer cmd, const mat4 *view_proj,
+                         VkExtent2D extent, VkDeviceAddress inst_addr, uint32_t count) {
+    if (!cr->skel_vbuf || cr->skel_vert_count == 0) return;   /* rig with no bones */
+
+    VkVertexInputBindingDescription2EXT b = { VK_STRUCTURE_TYPE_VERTEX_INPUT_BINDING_DESCRIPTION_2_EXT };
+    b.binding = 0; b.stride = sizeof(SkelVertex); b.inputRate = VK_VERTEX_INPUT_RATE_VERTEX; b.divisor = 1;
+    VkVertexInputAttributeDescription2EXT a[2];
+    for (int i = 0; i < 2; ++i) { a[i] = (VkVertexInputAttributeDescription2EXT){ VK_STRUCTURE_TYPE_VERTEX_INPUT_ATTRIBUTE_DESCRIPTION_2_EXT }; a[i].binding = 0; a[i].location = (uint32_t)i; }
+    a[0].format = VK_FORMAT_R32_UINT;          a[0].offset = offsetof(SkelVertex, joint);
+    a[1].format = VK_FORMAT_R32G32B32_SFLOAT;  a[1].offset = offsetof(SkelVertex, origin);
+
+    vkc_bind_shaders(ctx, cmd, cr->vs_skel, cr->fs_skel);
+    vkc_set_default_state(ctx, cmd, extent, &b, 1, a, 2);
+    vkCmdSetPrimitiveTopology(cmd, VK_PRIMITIVE_TOPOLOGY_LINE_LIST);   /* the one state lines flip; width is already 1.0 */
+    vkCmdSetCullMode(cmd, VK_CULL_MODE_NONE);                          /* face culling is meaningless for lines */
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, cr->layout, 0, 1, &cr->set, 0, NULL);
+
+    CrowdPush pc;
+    memcpy(pc.viewProj, view_proj->m, sizeof pc.viewProj);
+    pc.instances = inst_addr;
+    pc.texelsPerBone = 2;
+    pc.benchEps = 0.0f;   /* unused by crowd_skel.vert (no bench variant); kept for layout parity */
+    vkCmdPushConstants(cmd, cr->layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof pc, &pc);
+
+    VkDeviceSize zero = 0;
+    vkCmdBindVertexBuffers(cmd, 0, 1, &cr->skel_vbuf, &zero);
+    vkCmdDraw(cmd, cr->skel_vert_count, count, 0, 0);
+}
+
 void crowd_destroy(Crowd *cr, VkCtx *ctx) {
     vkDeviceWaitIdle(ctx->device);
     vkc_destroy_shader(ctx, cr->vs); vkc_destroy_shader(ctx, cr->fs);
     vkc_destroy_shader(ctx, cr->vs_skin_bench); vkc_destroy_shader(ctx, cr->vs_static_bench);
+    vkc_destroy_shader(ctx, cr->vs_skel); vkc_destroy_shader(ctx, cr->fs_skel);
+    vkc_destroy_buffer(ctx, cr->skel_vbuf, cr->skel_vmem);
     if (cr->layout) vkDestroyPipelineLayout(ctx->device, cr->layout, NULL);
     if (cr->desc_pool) vkDestroyDescriptorPool(ctx->device, cr->desc_pool, NULL);
     if (cr->set_layout) vkDestroyDescriptorSetLayout(ctx->device, cr->set_layout, NULL);

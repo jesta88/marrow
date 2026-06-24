@@ -39,6 +39,13 @@ int validate_cpu_crowd_layout(const ProcAssets *assets);
  * ½ binary16 quantization) - the demo-side f16 gate. CPU-only, no GPU. Returns 0 on pass. */
 int validate_cpu_crowd_f16(const ProcAssets *assets);
 
+/* Skeleton joint-origin parity: the bone-line render LOD poses each joint origin as
+ * M_joint . bind_origin (bind_origin = translation of inverse(inverse_bind)). Assert that equals the
+ * independent model_pose joint origin - Tier-A (canonical skinning palette) is algebraically exact,
+ * Tier-B (baked component-space bone) matches within half-float at a baked frame. CPU-only. Returns
+ * 0 on pass. */
+int validate_skeleton_origins(const ProcAssets *assets);
+
 /* Concurrency parity: run mrw_batch_clip_to_palette serially over N instances, then run the SAME
  * work fanned across a thread pool (each lane a disjoint output slice + its own scratch, sharing the
  * read-only skeleton/clip views + dispatch), and assert the two outputs are BIT-IDENTICAL - the

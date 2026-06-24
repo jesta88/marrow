@@ -10,12 +10,14 @@
  * Controls: WASD/Q/E fly, hold right-mouse to look, Shift sprint, Esc quit.
  *           M cycle model (procedural biped + every baked model in the assets folder),
  *           P promote heroes (CPU <-> baked GPU), T toggle crowd tier (GPU <-> CPU),
+ *           K toggle crowd skeleton render LOD (bone lines vs skinned mesh, GPU-baked tier),
  *           B cycle CPU backend (scalar/SSE2/AVX2), 1/2/3 pick backend directly,
  *           J toggle multithreaded CPU-batch (palette-gen across cores),
  *           H toggle CPU-batch palette f32 <-> f16 (half the write/upload/fetch),
  *           -/= halve/double the live entity count, R reset perf stats,
  *           F1 toggle HUD, F2 HUD detail.
  * Flags: --count N, --promote, --crowd-tier {gpu|cpu}, --crowd-f16 (CPU tier, f16 palette),
+ *        --skeleton (draw the GPU-baked crowd as bone lines),
  *        --frames N, --screenshot PATH, --validate, --validate-gpu,
  *        --bench [--bench-out FILE] [--smoke], --selftest-assets, --cycle-models,
  *        --showcase (CPU additive/mask/aim/two-bone-IK scene on the biped),
@@ -117,6 +119,7 @@ typedef struct {
     uint32_t     joint_count;
     const char  *model;   /* active model name, for the HUD/title */
     CrowdDrawMode crowd_mode;   /* FULL interactively; the bench sweeps the discard variants */
+    int          skeleton;      /* K / --skeleton: draw the GPU-baked crowd as bone lines, not mesh */
 } Scene;
 
 /* Simulate + record + submit one frame. tier: 0 = GPU-baked crowd, 1 = CPU-batch crowd. Returns 0
@@ -159,8 +162,13 @@ static int scene_frame(Scene *s, Camera *cam, float dt, int tier,
     uint64_t crowd_count = use_gpu_crowd ? s->crowd->count : s->ccpu->count;
     uint64_t inst = crowd_count + (draw_heroes ? s->heroes->count : 0);
     uint64_t tris_per = s->mesh->index_count / 3;
+    int crowd_skel = use_gpu_crowd && s->skeleton;     /* crowd drawn as bone lines, not skinned mesh */
+    /* The skeleton render LOD draws lines, not triangles, so it contributes ZERO triangles - but the
+     * full per-instance/per-bone ANIMATION still runs, so instances/bones are unchanged. This is the
+     * point: render cost drops off the vertex wall while marrow's number holds. */
+    uint64_t mesh_inst = (crowd_skel ? 0 : crowd_count) + (draw_heroes ? s->heroes->count : 0);
     prof->instances = inst;
-    prof->triangles = tris_per * inst + 2;     /* + ground quad */
+    prof->triangles = tris_per * mesh_inst + 2;     /* + ground quad */
     prof->bones     = (uint64_t)s->joint_count * inst;
     prof->gen_bones = use_gpu_crowd ? 0 : (uint64_t)s->joint_count * s->ccpu->count;  /* PALETTE_GEN coverage */
     prof->draws     = 2 + (draw_heroes ? 1u : 0u) + (draw_hud ? 1u : 0u);
@@ -174,8 +182,11 @@ static int scene_frame(Scene *s, Camera *cam, float dt, int tier,
     vkc_gpu_zone_end(ctx, cmd, VKC_GPU_ZONE_GROUND);
 
     vkc_gpu_zone_begin(ctx, cmd, VKC_GPU_ZONE_CROWD);
-    if (use_gpu_crowd) crowd_draw(s->crowd, ctx, cmd, &view_proj, extent, s->crowd_mode);
-    else               crowd_cpu_draw(s->ccpu, ctx, cmd, &view_proj, extent);
+    if (use_gpu_crowd && s->skeleton)
+        crowd_draw_skeleton(s->crowd, ctx, cmd, &view_proj, extent,
+                            s->crowd->inst_addr[ctx->cur_frame], s->crowd->count);
+    else if (use_gpu_crowd) crowd_draw(s->crowd, ctx, cmd, &view_proj, extent, s->crowd_mode);
+    else                    crowd_cpu_draw(s->ccpu, ctx, cmd, &view_proj, extent);
     vkc_gpu_zone_end(ctx, cmd, VKC_GPU_ZONE_CROWD);
 
     if (draw_heroes) {
@@ -574,6 +585,7 @@ int main(int argc, char **argv) {
     int max_frames = 0; const char *shot = NULL; int selftest_assets = 0; uint32_t count = 1600;
     int promote = 0, tier = 0;   /* tier: 0 = GPU-baked, 1 = CPU-batch */
     int do_validate = 0, do_validate_gpu = 0, do_bench = 0, smoke = 0, crowd_f16 = 0, cycle_models = 0;
+    int skeleton = 0;   /* --skeleton / K: draw the GPU-baked crowd as bone lines */
     const char *gltf_path = NULL, *mrw_path = NULL, *bench_out = NULL;
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--frames") && i + 1 < argc) max_frames = atoi(argv[++i]);
@@ -589,6 +601,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--smoke")) smoke = 1;
         else if (!strcmp(argv[i], "--selftest-assets")) selftest_assets = 1;
         else if (!strcmp(argv[i], "--cycle-models")) cycle_models = 1;  /* headless switch smoke */
+        else if (!strcmp(argv[i], "--skeleton")) skeleton = 1;          /* bone-line crowd render LOD */
         else if (!strcmp(argv[i], "--showcase")) heroes_set_showcase(1); /* CPU pose-ops scene */
         else if (!strcmp(argv[i], "--gltf") && i + 1 < argc) gltf_path = argv[++i];
         else if (!strcmp(argv[i], "--mrw") && i + 1 < argc) mrw_path = argv[++i];
@@ -684,14 +697,15 @@ int main(int argc, char **argv) {
     Profiler prof; prof_init(&prof);
     Scene s = { .ctx = &ctx, .prof = &prof, .mesh = &mg.mesh, .ground = &ground,
                 .crowd = mg.have_crowd ? &mg.crowd : NULL, .ccpu = &mg.ccpu, .heroes = &mg.heroes,
-                .hud = &hud, .joint_count = mg.assets.joint_count, .model = reg.items[model_idx].name };
+                .hud = &hud, .joint_count = mg.assets.joint_count, .model = reg.items[model_idx].name,
+                .skeleton = skeleton };
 
     Camera cam; camera_init(&cam, v3(0.0f, 8.0f, 40.0f), 0.0f, -0.20f);
 
     uint64_t rendered = 0;
     int cyc_seen = 1;   /* --cycle-models: models visited so far (startup counts as one) */
     int prev_p = 0, prev_f1 = 0, prev_f2 = 0, prev_t = 0, prev_b = 0, prev_r = 0, prev_j = 0, prev_h = 0, prev_m = 0;
-    int prev_dec = 0, prev_inc = 0, prev_k1 = 0, prev_k2 = 0, prev_k3 = 0;
+    int prev_dec = 0, prev_inc = 0, prev_k1 = 0, prev_k2 = 0, prev_k3 = 0, prev_k = 0;
     double prev = prof_now_s(), last_title = prev;
     while (!glfwWindowShouldClose(win)) {
         glfwPollEvents();
@@ -765,6 +779,12 @@ int main(int argc, char **argv) {
         /* H: flip the CPU-batch palette between f32 and f16 - half the write/upload/fetch. */
         int kh = glfwGetKey(win, GLFW_KEY_H);
         if (kh == GLFW_PRESS && !prev_h) { crowd_cpu_toggle_f16(&mg.ccpu); prof_reset_stats(&prof); } prev_h = kh;
+
+        /* K: draw the GPU-baked crowd as a bone-line skeleton instead of the skinned mesh - the cheap
+         * render LOD that keeps the frame-time bar green at high counts (animation cost is unchanged). */
+        int kk = glfwGetKey(win, GLFW_KEY_K);
+        if (kk == GLFW_PRESS && !prev_k) { skeleton = !skeleton; prof_reset_stats(&prof); } prev_k = kk;
+        s.skeleton = skeleton;
 
         /* Live entity count: '-' halves, '=' (or numpad +/-) doubles. Buffers are capacity-sized, so
          * this only rebuilds the grid + re-uploads - no reallocation. Idle first since the CPU tier's
