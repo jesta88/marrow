@@ -72,4 +72,5 @@ DISABLE_INDEX          = NO
 FULL_SIDEBAR           = NO
 HTML_COLORSTYLE        = LIGHT
 HTML_EXTRA_STYLESHEET  = site/theme/doxygen-awesome.css \
-                         site/theme/doxygen-awesome-sidebar-only.css
+                         site/theme/doxygen-awesome-sidebar-only.css \
+                         site/theme/marrow.css

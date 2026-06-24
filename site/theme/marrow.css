@@ -1,0 +1,13 @@
+/* marrow's own tweaks layered on top of the vendored Doxygen Awesome theme.
+ * Loaded last (see HTML_EXTRA_STYLESHEET in Doxyfile) so these rules win. This file
+ * is NOT part of the upstream vendor drop — preserve it when updating Doxygen Awesome.
+ */
+
+/* The sidebar-only layout pins the title area to a fixed --top-height and clips any
+ * overflow. The default (120px) assumed a one-line header, so once the project brief
+ * wrapped to a second line the search box below it was cut in half. Raise the height to
+ * fit the title + wrapped brief + search field, with headroom for a third brief line
+ * (wider system fonts on Linux/macOS can wrap one further than Windows does). */
+html {
+    --top-height: 170px;
+}

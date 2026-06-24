@@ -6,5 +6,9 @@ The documentation site is styled with [Doxygen Awesome](https://github.com/jothe
 - `doxygen-awesome.css`, `doxygen-awesome-sidebar-only.css` — the theme (referenced by `Doxyfile`).
 - `LICENSE` — Doxygen Awesome's MIT license.
 
-To update: replace these files from the upstream tag and bump the version noted above.
-Doxygen Awesome is MIT-licensed and independent of marrow's own MIT license.
+`marrow.css` is **not** vendored — it holds marrow's own tweaks layered on top of the theme
+(loaded last in `Doxyfile`). Keep it when refreshing the vendored files.
+
+To update the theme: replace the two `doxygen-awesome-*.css` files (and `LICENSE`) from the
+upstream tag and bump the version noted above; leave `marrow.css` in place. Doxygen Awesome is
+MIT-licensed and independent of marrow's own MIT license.

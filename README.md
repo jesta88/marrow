@@ -214,6 +214,10 @@ Desktop x64 and current/last-gen consoles (little-endian). **AVX2 (+FMA)** is th
 path; **SSE2** is the portable x64 baseline and fallback (also the right width for Jaguar-class
 PS4/Xbox One); **scalar** is the reference and fallback.
 
+## AI Disclaimer
+
+Claude was used while making this project for several parts (the boring ones). The library runtime wasn't "vibe-coded".
+
 ## License
 
 [MIT](LICENSE) © 2026 Jérémie St-Amand.
