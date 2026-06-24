@@ -12,9 +12,7 @@ marrow turns skeletons and animation clips into skinning matrices. It is *batch-
 call animates `N` instances that share a skeleton, so you can drive tens of thousands of
 characters without tens of thousands of per-instance virtual calls.
 
-📖 **Documentation:** **<https://jesta88.github.io/marrow/>** — quick start, how-to guides,
-concepts, and the API reference (generated from `marrow.h`). Built from [`site/`](site/) with
-Doxygen; see [`Doxyfile`](Doxyfile).
+**Documentation:** **<https://jesta88.github.io/marrow/>**
 
 ---
 
