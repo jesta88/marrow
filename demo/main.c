@@ -14,8 +14,9 @@
  * Controls: WASD/Q/E fly, hold right-mouse to look, Shift sprint, Esc quit.
  *           M cycle model (procedural biped + every baked model in the assets folder),
  *           -/= halve/double the live entity count, [ / ] shrink/grow the Tier-A radius R_A,
+ *           ; / ' shrink/grow the render-LOD radius R_mesh, K toggle whole-field bone-line skeleton,
  *           R reset perf stats, F1 toggle HUD, F2 HUD detail.
- * Flags: --count N, --lod-range R_A[,R_mesh],
+ * Flags: --count N, --lod-range R_A[,R_mesh], --skeleton,
  *        --frames N, --screenshot PATH, --validate, --validate-gpu,
  *        --bench [--bench-out FILE] [--smoke], --selftest-assets, --cycle-models,
  *        --gltf PATH [--mrw PATH]. */
@@ -209,9 +210,10 @@ static int scene_frame(Scene *s, Camera *cam, float dt, int tier,
     return 1;
 }
 
-/* Interactive frame for the unified LOD field. Maps near=Tier-A onto the HEROES GPU zone and
- * far=Tier-B onto the CROWD GPU zone so the existing HUD zone labels still read sensibly. This is the
- * live scene only; --bench / --validate keep their own paths (which still drive crowd + ccpu). */
+/* Interactive frame for the unified LOD field. GPU zones: CROWD = far Tier-B full-mesh band,
+ * HEROES = near Tier-A mesh band, SKEL = all bone-line work (the far skeleton tail past R_mesh, plus
+ * the whole near set under the global all-skeleton toggle) - so mesh vs skeleton cost reads separately
+ * in the HUD. This is the live scene only; --bench / --validate keep their own paths (crowd + ccpu). */
 static int field_frame(VkCtx *ctx, Profiler *prof, Ground *ground, Field *field, Hud *hud,
                        Camera *cam, float dt, const char *model, int draw_hud) {
     VkCommandBuffer cmd; VkExtent2D extent;
@@ -230,37 +232,61 @@ static int field_frame(VkCtx *ctx, Profiler *prof, Ground *ground, Field *field,
     float aspect = (float)extent.width / (float)extent.height;
     mat4 view_proj = camera_view_proj(cam, aspect);
 
-    /* Publish counters BEFORE recording so the HUD reads THIS frame's split. P1 draws every entity as
-     * a skinned mesh (the skeleton render LOD lands later), so triangles/bones cover the whole field;
-     * the batched-blend kernel (PALETTE_GEN) only touches the near set, so gen_bones is near-only. */
+    /* Publish counters BEFORE recording so the HUD reads THIS frame's split. The render-LOD split:
+     * near is full mesh unless the global all-skeleton toggle is on; the far set is a full-mesh band
+     * plus a bone-line tail past R_mesh. Triangles count MESH instances only (skeletons are lines,
+     * counted separately); the per-instance/per-bone ANIMATION still runs for every entity, so `bones`
+     * covers the whole field. The batched-blend kernel (PALETTE_GEN) only touches the near set, so
+     * gen_bones is near-only. */
     const SharedMesh *mesh = field->crowd->mesh;
     uint64_t inst = field->count;
     uint64_t tris_per = mesh->index_count / 3;
+    int near_skel = field->skeleton_all;
+    uint64_t mesh_inst = (uint64_t)field->far_mesh_count + (near_skel ? 0u : field->near_count);
+    uint64_t skel_inst = (uint64_t)field->far_skel_count + (near_skel ? field->near_count : 0u);
+    uint64_t lines_per = (uint64_t)field->crowd->skel_vert_count / 2u;   /* one LINE_LIST segment per bone */
     prof->instances  = inst;
-    prof->triangles  = tris_per * inst + 2;            /* + ground quad */
+    prof->triangles  = tris_per * mesh_inst + 2;       /* + ground quad */
+    prof->lines      = lines_per * skel_inst;
     prof->bones      = (uint64_t)field->joint_count * inst;
     prof->gen_bones  = (uint64_t)field->joint_count * field->near_count;
-    prof->draws      = 1u + (field->far_count ? 1u : 0u) + (field->near_count ? 1u : 0u) + (draw_hud ? 1u : 0u);
+    int near_mesh_draw = field->near_count && !near_skel;
+    int near_skel_draw = field->near_count &&  near_skel;
+    prof->draws      = 1u                                   /* ground */
+                     + (field->far_mesh_count ? 1u : 0u)
+                     + (near_mesh_draw       ? 1u : 0u)
+                     + (field->far_skel_count ? 1u : 0u)
+                     + (near_skel_draw       ? 1u : 0u)
+                     + (draw_hud             ? 1u : 0u);
     prof->tier       = "field";
     prof->backend    = field->backend_name;
     prof->model      = model;
-    prof->field_near    = field->near_count;
-    prof->field_far     = field->far_count;
-    prof->field_clamped = field->near_clamped;
-    prof->field_r_a     = field->lod.r_a;
+    prof->field_near     = field->near_count;
+    prof->field_far      = field->far_count;
+    prof->field_far_mesh = field->far_mesh_count;
+    prof->field_far_skel = field->far_skel_count;
+    prof->field_clamped  = field->near_clamped;
+    prof->field_r_a      = field->lod.r_a;
+    prof->field_r_mesh   = field->lod.r_mesh;
+    prof->field_skel_all = field->skeleton_all;
 
     prof_begin(prof, PROF_RECORD);
     vkc_gpu_zone_begin(ctx, cmd, VKC_GPU_ZONE_GROUND);
     ground_draw(ground, ctx, cmd, &view_proj, extent);
     vkc_gpu_zone_end(ctx, cmd, VKC_GPU_ZONE_GROUND);
 
-    vkc_gpu_zone_begin(ctx, cmd, VKC_GPU_ZONE_CROWD);   /* far Tier-B band */
+    vkc_gpu_zone_begin(ctx, cmd, VKC_GPU_ZONE_CROWD);   /* far Tier-B full-mesh band */
     field_draw_far(field, ctx, cmd, &view_proj, extent);
     vkc_gpu_zone_end(ctx, cmd, VKC_GPU_ZONE_CROWD);
 
-    vkc_gpu_zone_begin(ctx, cmd, VKC_GPU_ZONE_HEROES);  /* near Tier-A band */
+    vkc_gpu_zone_begin(ctx, cmd, VKC_GPU_ZONE_HEROES);  /* near Tier-A mesh band */
     field_draw_near(field, ctx, cmd, &view_proj, extent);
     vkc_gpu_zone_end(ctx, cmd, VKC_GPU_ZONE_HEROES);
+
+    vkc_gpu_zone_begin(ctx, cmd, VKC_GPU_ZONE_SKEL);    /* bone-line render LOD: far tail + global near */
+    field_draw_far_skeleton(field, ctx, cmd, &view_proj, extent);
+    field_draw_near_skeleton(field, ctx, cmd, &view_proj, extent);
+    vkc_gpu_zone_end(ctx, cmd, VKC_GPU_ZONE_SKEL);
 
     if (draw_hud) hud_draw(hud, ctx, cmd, extent, prof);
     prof_end(prof, PROF_RECORD);
@@ -648,8 +674,8 @@ int main(int argc, char **argv) {
     int max_frames = 0; const char *shot = NULL; int selftest_assets = 0;
     uint32_t count = 1600; int count_set = 0;
     int do_validate = 0, do_validate_gpu = 0, do_bench = 0, smoke = 0, cycle_models = 0;
-    int skeleton = 0;   /* --skeleton: returns as the field's render LOD in a later step */
-    FieldLod lod = { .r_a = 35.0f, .r_mesh = 1.0e9f };   /* r_mesh huge => P1 draws the whole field as mesh */
+    int skeleton = 0;   /* --skeleton / K: draw the WHOLE field as bone lines (global render mode) */
+    FieldLod lod = { .r_a = 35.0f, .r_mesh = 90.0f };   /* near band Tier-A; mesh out to R_mesh, skeleton tail beyond */
     const char *gltf_path = NULL, *mrw_path = NULL, *bench_out = NULL;
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--frames") && i + 1 < argc) max_frames = atoi(argv[++i]);
@@ -746,13 +772,12 @@ int main(int argc, char **argv) {
     if (!count_set) count = 8192u;
     uint32_t capacity = FIELD_TOTAL_CAP;
     if (count > capacity) count = capacity;
-    if (skeleton)
-        fprintf(stderr, "[demo] note: --skeleton/K returns as the field's render LOD in a later step\n");
 
     FieldModel mg;
     if (!field_model_load(&mg, &ctx, &reg.items[model_idx], count, lod)) {
         fprintf(stderr, "model load failed\n"); return 1;
     }
+    mg.field.skeleton_all = skeleton;   /* --skeleton: start in whole-field bone-line mode */
 
     Hud hud;
     if (!hud_init(&hud, &ctx)) { fprintf(stderr, "hud init failed\n"); return 1; }
@@ -764,6 +789,7 @@ int main(int argc, char **argv) {
     int cyc_seen = 1;   /* --cycle-models: models visited so far (startup counts as one) */
     int prev_f1 = 0, prev_f2 = 0, prev_r = 0, prev_m = 0;
     int prev_dec = 0, prev_inc = 0, prev_lb = 0, prev_rb = 0;
+    int prev_sc = 0, prev_qt = 0, prev_k = 0;
     double prev = prof_now_s(), last_title = prev;
     while (!glfwWindowShouldClose(win)) {
         glfwPollEvents();
@@ -794,6 +820,7 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "[demo] fatal: could not reload model '%s'\n", reg.items[model_idx].name);
                 break;
             }
+            mg.field.skeleton_all = skeleton;   /* field_init reset it; carry the live toggle across the rebuild */
             fprintf(stderr, "[demo] model -> %s (%u joints)\n", reg.items[model_idx].name, mg.assets.joint_count);
             prof_reset_stats(&prof);
         }
@@ -801,13 +828,25 @@ int main(int argc, char **argv) {
         int kr = glfwGetKey(win, GLFW_KEY_R);
         if (kr == GLFW_PRESS && !prev_r) prof_reset_stats(&prof); prev_r = kr;
 
-        /* [ / ]: shrink / grow the animation-tier radius R_A - how deep the near Tier-A band reaches.
-         * Mutated in place on the live field; the next partition picks it up. */
+        /* [ / ]: shrink / grow R_A (how deep the near Tier-A band reaches); ; / ' : shrink / grow
+         * R_mesh (the mesh -> bone-line render-LOD radius). Tracked in `lod` so an M model switch keeps
+         * the live ranges, and mirrored onto the field for the next partition. */
         int klb = glfwGetKey(win, GLFW_KEY_LEFT_BRACKET) == GLFW_PRESS;
         int krb = glfwGetKey(win, GLFW_KEY_RIGHT_BRACKET) == GLFW_PRESS;
-        if (klb && !prev_lb) { mg.field.lod.r_a = mg.field.lod.r_a > 10.0f ? mg.field.lod.r_a - 5.0f : 5.0f; prof_reset_stats(&prof); }
-        if (krb && !prev_rb) { mg.field.lod.r_a += 5.0f; prof_reset_stats(&prof); }
-        prev_lb = klb; prev_rb = krb;
+        int ksc = glfwGetKey(win, GLFW_KEY_SEMICOLON) == GLFW_PRESS;
+        int kqt = glfwGetKey(win, GLFW_KEY_APOSTROPHE) == GLFW_PRESS;
+        int lod_changed = 0;
+        if (klb && !prev_lb) { lod.r_a = lod.r_a > 10.0f ? lod.r_a - 5.0f : 5.0f; lod_changed = 1; }
+        if (krb && !prev_rb) { lod.r_a += 5.0f; lod_changed = 1; }
+        if (ksc && !prev_sc) { lod.r_mesh = lod.r_mesh > 10.0f ? lod.r_mesh - 5.0f : 5.0f; lod_changed = 1; }
+        if (kqt && !prev_qt) { lod.r_mesh += 5.0f; lod_changed = 1; }
+        if (lod_changed) { mg.field.lod = lod; prof_reset_stats(&prof); }
+        prev_lb = klb; prev_rb = krb; prev_sc = ksc; prev_qt = kqt;
+
+        /* K: toggle the global all-skeleton render mode (whole field as bone lines). */
+        int kk = glfwGetKey(win, GLFW_KEY_K) == GLFW_PRESS;
+        if (kk && !prev_k) { skeleton = !skeleton; mg.field.skeleton_all = skeleton; prof_reset_stats(&prof); }
+        prev_k = kk;
 
         /* Live entity count: '-' halves, '=' (or numpad +/-) doubles, up to FIELD_TOTAL_CAP. Buffers
          * are capacity-sized, so this only re-lays-out the grid (CPU) - no reallocation, no device

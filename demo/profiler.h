@@ -41,6 +41,7 @@ typedef enum {
     PROF_GPU_GROUND,
     PROF_GPU_CROWD,
     PROF_GPU_HEROES,
+    PROF_GPU_SKEL,          /* bone-line render LOD (far tail + global all-skeleton near)    */
     PROF_GPU_HUD,
     PROF_GPU_COUNT
 } prof_gpu_zone;
@@ -80,11 +81,16 @@ typedef struct {
 
     /* counters set by the render loop */
     uint64_t  instances, draws, triangles, bones;
+    uint64_t  lines;                      /* bone-line segments drawn (skeleton render LOD); 0 if none */
     /* unified-field LOD split (field_r_a > 0 only in the field scene; 0 marks "not the field").
+     * The far set is itself split by the render-LOD radius R_mesh into a full-mesh band (field_far_mesh)
+     * and a bone-line skeleton tail (field_far_skel); field_skel_all = the global all-skeleton toggle.
      * field_clamped > 0 means more than near_cap entities fell inside R_A, so the surplus rendered
      * Tier B this frame (the bounded, honest near-cap fallback). */
     uint32_t  field_near, field_far, field_clamped;
-    float     field_r_a;
+    uint32_t  field_far_mesh, field_far_skel;
+    float     field_r_a, field_r_mesh;
+    int       field_skel_all;
     uint64_t  gen_bones;                  /* bone-instances the PALETTE_GEN kernel covered this frame
                                              (cpu-crowd count x joints); 0 on the GPU tier. Lets the HUD
                                              report scale-invariant ns/(instance.bone) without the

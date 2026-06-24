@@ -23,6 +23,7 @@ typedef enum {
     VKC_GPU_ZONE_GROUND,
     VKC_GPU_ZONE_CROWD,
     VKC_GPU_ZONE_HEROES,
+    VKC_GPU_ZONE_SKEL,      /* bone-line render LOD (far tail + global all-skeleton near) */
     VKC_GPU_ZONE_HUD,
     VKC_GPU_ZONE_COUNT
 } vkc_gpu_zone;

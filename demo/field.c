@@ -25,8 +25,15 @@ _Static_assert(sizeof(FieldPush) == 88, "FieldPush must be 88 bytes");
 /* near candidate for the deterministic top-K (nearest near_cap by distance, id-tie-broken). */
 typedef struct { float d2; uint32_t id; uint32_t idx; } Cand;
 
+/* Mirrors crowd.c's SkelVertex: the layout of the borrowed crowd's static bone-line VB, which the
+ * near skeleton draw reuses (one endpoint = {joint, bind-model-space origin}). */
+typedef struct { uint32_t joint; float origin[3]; } FieldSkelVertex;
+_Static_assert(sizeof(FieldSkelVertex) == 16, "FieldSkelVertex must be 16 bytes");
+
 #include "skin_tierA_vert.spv.h"
+#include "skin_tierA_skel_vert.spv.h"   /* near bone-line skeleton (global all-skeleton toggle) */
 #include "crowd_frag.spv.h"   /* reuse the crowd fragment (same vNormal/vColor inputs) */
+#include "skel_frag.spv.h"    /* flat per-instance tint for the bone lines */
 
 /* crowd.vert's per-instance tint, computed CPU-side from the stable id so the near Tier-A color
  * matches the far Tier-B color for the same entity (the seamless-promotion claim). */
@@ -177,6 +184,10 @@ int field_init(Field *f, VkCtx *ctx, const ProcAssets *assets, Crowd *crowd,
     if (vkCreatePipelineLayout(ctx->device, &li, NULL, &f->layout) != VK_SUCCESS) goto fail;
     if (!vkc_create_graphics_shaders(ctx, skin_tierA_vert_spv, sizeof skin_tierA_vert_spv,
             crowd_frag_spv, sizeof crowd_frag_spv, NULL, 0, &pr, &f->vs, &f->fs)) goto fail;
+    /* bone-line variant of the near pipeline: the Tier-A skeleton VS poses joint origins from the same
+     * CPU palette SSBO the mesh skins from, sharing this layout; a flat fragment (no normals). */
+    if (!vkc_create_graphics_shaders(ctx, skin_tierA_skel_vert_spv, sizeof skin_tierA_skel_vert_spv,
+            skel_frag_spv, sizeof skel_frag_spv, NULL, 0, &pr, &f->vs_skel, &f->fs_skel)) goto fail;
 
     mrw_dispatch_detect(&f->disp);
     f->backend_name = backend_name(f->disp.backend);
@@ -256,10 +267,14 @@ void field_update(Field *f, const float cam_pos[3], float dt, uint32_t frame, Pr
     for (uint32_t s = 0; s < nsel; ++s) f->near_mark[cand[s].idx] = 1;
 
     /* counting-sort the near set by (clipA,clipB) into contiguous homogeneous groups, so the batched
-     * blend runs once per pair. Keys are clipA*cc+clipB (<= cc*cc bins). */
+     * blend runs once per pair (keys are clipA*cc+clipB, <= cc*cc bins); in the same pass count the far
+     * full-mesh entities so the far set can be compacted into a mesh sub-range then a skeleton tail. */
     uint32_t kcount[FIELD_MAX_GROUPS] = { 0 };
-    for (uint32_t i = 0; i < count; ++i)
+    uint32_t far_mesh = 0;
+    for (uint32_t i = 0; i < count; ++i) {
         if (f->near_mark[i]) kcount[f->ent[i].clipA * cc + f->ent[i].clipB]++;
+        else if (!f->skeleton_all && f->render_lod[i] == 0) far_mesh++;
+    }
     uint32_t cursor[FIELD_MAX_GROUPS], acc = 0;
     f->group_count = 0;
     for (uint32_t key = 0; key < cc * cc; ++key) {
@@ -276,8 +291,10 @@ void field_update(Field *f, const float cam_pos[3], float dt, uint32_t frame, Pr
     f->near_count = acc;
 
     /* compact: near entities scatter into their sorted group slot (model+tint+batch inputs); far
-     * entities append into the InstanceAnim stage carrying the stable id (clipB.w) for the tint. */
-    uint32_t far_n = 0;
+     * entities append into the InstanceAnim stage carrying the stable id (clipB.w) for the tint. The
+     * far set splits by render LOD into a full-mesh band [0, far_mesh) then a skeleton tail
+     * [far_mesh, far_count); the global all-skeleton toggle forces every far entity into the tail. */
+    uint32_t fm = 0, fs = far_mesh;
     for (uint32_t i = 0; i < count; ++i) {
         const FieldEntity *e = &f->ent[i];
         mat4 model = mat4_translate(v3(e->pos[0], e->pos[1], e->pos[2]));
@@ -289,7 +306,8 @@ void field_update(Field *f, const float cam_pos[3], float dt, uint32_t frame, Pr
             f->timesB[dst]  = e->phase;
             f->weights[dst] = e->w;
         } else {
-            InstanceAnim *a = &f->far_stage[far_n++];
+            uint32_t dst = (!f->skeleton_all && f->render_lod[i] == 0) ? fm++ : fs++;
+            InstanceAnim *a = &f->far_stage[dst];
             memcpy(a->model, model.m, sizeof model.m);
             uint32_t cA = e->clipA, cB = e->clipB;
             a->clipA[0] = f->baked_first[cA]; a->clipA[1] = f->baked_count[cA]; a->clipA[2] = f->baked_loop[cA]; a->clipA[3] = 0;
@@ -298,7 +316,9 @@ void field_update(Field *f, const float cam_pos[3], float dt, uint32_t frame, Pr
             a->blend[0] = e->w; a->blend[1] = a->blend[2] = a->blend[3] = 0.0f;
         }
     }
-    f->far_count = far_n;
+    f->far_mesh_count = far_mesh;
+    f->far_skel_count = fs - far_mesh;
+    f->far_count = fs;
     prof_end(prof, PROF_LOD);
 
     /* (3) PALETTE_GEN: one homogeneous batched blend per clip-pair group into the cacheable scratch. */
@@ -324,13 +344,21 @@ void field_update(Field *f, const float cam_pos[3], float dt, uint32_t frame, Pr
 }
 
 void field_draw_far(Field *f, VkCtx *ctx, VkCommandBuffer cmd, const mat4 *view_proj, VkExtent2D extent) {
-    if (f->far_count == 0) return;
+    if (f->far_mesh_count == 0) return;
     crowd_draw_instances(f->crowd, ctx, cmd, view_proj, extent,
-                         f->far_addr[ctx->cur_frame], f->far_count, CROWD_DRAW_FULL);
+                         f->far_addr[ctx->cur_frame], f->far_mesh_count, CROWD_DRAW_FULL);
+}
+
+void field_draw_far_skeleton(Field *f, VkCtx *ctx, VkCommandBuffer cmd, const mat4 *view_proj, VkExtent2D extent) {
+    if (f->far_skel_count == 0) return;
+    /* the skeleton tail occupies [far_mesh_count, far_count) of the same buffer - offset the base
+     * address past the mesh band so the draw's gl_InstanceIndex addresses the tail from 0. */
+    VkDeviceAddress base = f->far_addr[ctx->cur_frame] + (VkDeviceSize)f->far_mesh_count * sizeof(InstanceAnim);
+    crowd_draw_skeleton(f->crowd, ctx, cmd, view_proj, extent, base, f->far_skel_count);
 }
 
 void field_draw_near(Field *f, VkCtx *ctx, VkCommandBuffer cmd, const mat4 *view_proj, VkExtent2D extent) {
-    if (f->near_count == 0) return;
+    if (f->near_count == 0 || f->skeleton_all) return;   /* under the global toggle the near set is lines */
     const SharedMesh *mesh = f->crowd->mesh;
 
     VkVertexInputBindingDescription2EXT b = { VK_STRUCTURE_TYPE_VERTEX_INPUT_BINDING_DESCRIPTION_2_EXT };
@@ -361,9 +389,42 @@ void field_draw_near(Field *f, VkCtx *ctx, VkCommandBuffer cmd, const mat4 *view
     vkCmdDrawIndexed(cmd, mesh->index_count, f->near_count, 0, 0, 0);
 }
 
+void field_draw_near_skeleton(Field *f, VkCtx *ctx, VkCommandBuffer cmd, const mat4 *view_proj, VkExtent2D extent) {
+    if (!f->skeleton_all || f->near_count == 0) return;
+    const Crowd *cr = f->crowd;
+    if (!cr->skel_vbuf || cr->skel_vert_count == 0) return;   /* rig with no bones */
+
+    /* same static bone-line VB the far tail uses (borrowed from the crowd), posed instead from the near
+     * set's CPU Tier-A palette: skin_tierA_skel.vert fetches M_joint by index and outputs M . restOrigin. */
+    VkVertexInputBindingDescription2EXT b = { VK_STRUCTURE_TYPE_VERTEX_INPUT_BINDING_DESCRIPTION_2_EXT };
+    b.binding = 0; b.stride = sizeof(FieldSkelVertex); b.inputRate = VK_VERTEX_INPUT_RATE_VERTEX; b.divisor = 1;
+    VkVertexInputAttributeDescription2EXT a[2];
+    for (int i = 0; i < 2; ++i) { a[i] = (VkVertexInputAttributeDescription2EXT){ VK_STRUCTURE_TYPE_VERTEX_INPUT_ATTRIBUTE_DESCRIPTION_2_EXT }; a[i].binding = 0; a[i].location = (uint32_t)i; }
+    a[0].format = VK_FORMAT_R32_UINT;          a[0].offset = offsetof(FieldSkelVertex, joint);
+    a[1].format = VK_FORMAT_R32G32B32_SFLOAT;  a[1].offset = offsetof(FieldSkelVertex, origin);
+
+    vkc_bind_shaders(ctx, cmd, f->vs_skel, f->fs_skel);
+    vkc_set_default_state(ctx, cmd, extent, &b, 1, a, 2);
+    vkCmdSetPrimitiveTopology(cmd, VK_PRIMITIVE_TOPOLOGY_LINE_LIST);   /* the one state the lines flip */
+    vkCmdSetCullMode(cmd, VK_CULL_MODE_NONE);                          /* face culling is meaningless for lines */
+
+    FieldPush pc;
+    memcpy(pc.viewProj, view_proj->m, sizeof pc.viewProj);
+    pc.heroes = f->hero_addr[ctx->cur_frame];
+    pc.palettes = f->pal_addr[ctx->cur_frame];
+    pc.jointCount = f->joint_count;
+    pc._pad = 0;
+    vkCmdPushConstants(cmd, f->layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof pc, &pc);
+
+    VkDeviceSize zero = 0;
+    vkCmdBindVertexBuffers(cmd, 0, 1, &cr->skel_vbuf, &zero);
+    vkCmdDraw(cmd, cr->skel_vert_count, f->near_count, 0, 0);
+}
+
 void field_destroy(Field *f, VkCtx *ctx) {
     vkDeviceWaitIdle(ctx->device);
     vkc_destroy_shader(ctx, f->vs); vkc_destroy_shader(ctx, f->fs);
+    vkc_destroy_shader(ctx, f->vs_skel); vkc_destroy_shader(ctx, f->fs_skel);
     if (f->layout) vkDestroyPipelineLayout(ctx->device, f->layout, NULL);
     for (uint32_t fr = 0; fr < VKC_FRAMES_IN_FLIGHT; ++fr) {
         vkc_destroy_buffer(ctx, f->hero_buf[fr], f->hero_mem[fr]);

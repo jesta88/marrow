@@ -28,7 +28,7 @@ _Static_assert(sizeof(StbVert) == 16, "stb_easy_font vertex is 16 bytes");
 static const char *k_cpu_name[PROF_CPU_COUNT] = {
     "wait", "acquire", "crowd", "heroes", "palette_gen", "upload", "record", "submit", "lod"
 };
-static const char *k_gpu_name[PROF_GPU_COUNT] = { "frame", "ground", "crowd", "heroes", "hud" };
+static const char *k_gpu_name[PROF_GPU_COUNT] = { "frame", "ground", "crowd", "heroes", "skel", "hud" };
 
 /* ------------------------------------------------------------------ geometry builder */
 
@@ -133,12 +133,12 @@ static void build_graph(const Profiler *p, Builder *b, float gx, float gy, float
 void hud_draw(Hud *h, VkCtx *ctx, VkCommandBuffer cmd, VkExtent2D extent, const Profiler *prof) {
     if (!h->visible) return;
 
-    /* ---- assemble text lines ---- */
-    char L[24][128]; float C[24][4]; int n = 0;
+    /* ---- assemble text lines ---- (sized for the full F2-detail list: header + per-zone CPU/GPU rows) */
+    char L[32][128]; float C[32][4]; int n = 0;
     const float white[4] = { 0.92f, 0.94f, 1.00f, 1.0f };
     const float gold[4]  = { 1.00f, 0.82f, 0.20f, 1.0f };
     const float dim[4]   = { 0.70f, 0.76f, 0.88f, 1.0f };
-    #define LINE(c, ...) do { if (n < 24) { snprintf(L[n], sizeof L[0], __VA_ARGS__); \
+    #define LINE(c, ...) do { if (n < 32) { snprintf(L[n], sizeof L[0], __VA_ARGS__); \
         C[n][0]=(c)[0]; C[n][1]=(c)[1]; C[n][2]=(c)[2]; C[n][3]=(c)[3]; ++n; } } while (0)
 
     LINE(gold, "marrow demo   %s", prof->model ? prof->model : "?");
@@ -159,12 +159,15 @@ void hud_draw(Hud *h, VkCtx *ctx, VkCommandBuffer cmd, VkExtent2D extent, const 
     if (prof->gen_bones)
         LINE(gold, "  kernel %.2f ns/(inst.bone)  [%s]",
              prof->cpu[PROF_PALETTE_GEN].ema * 1e6 / (double)prof->gen_bones, prof->backend);
-    LINE(dim, "inst %llu  draws %llu  tris %.2fM  bones %.2fM",
+    LINE(dim, "inst %llu  draws %llu  tris %.2fM  lines %.2fM  bones %.2fM",
          (unsigned long long)prof->instances, (unsigned long long)prof->draws,
-         (double)prof->triangles * 1e-6, (double)prof->bones * 1e-6);
+         (double)prof->triangles * 1e-6, (double)prof->lines * 1e-6, (double)prof->bones * 1e-6);
     if (prof->field_r_a > 0.0f) {
-        LINE(gold, "LOD  near(A) %u  far(B) %u  R_A %.0f  lod %.3f ms",
-             prof->field_near, prof->field_far, (double)prof->field_r_a, prof->cpu[PROF_LOD].ema);
+        LINE(gold, "LOD  near(A) %u  far(B) %u  [mesh %u / skel %u]  lod %.3f ms",
+             prof->field_near, prof->field_far, prof->field_far_mesh, prof->field_far_skel,
+             prof->cpu[PROF_LOD].ema);
+        LINE(dim, "  R_A %.0f  R_mesh %.0f%s", (double)prof->field_r_a, (double)prof->field_r_mesh,
+             prof->field_skel_all ? "   K: all-skeleton" : "");
         if (prof->field_clamped)
             LINE(gold, "  near-cap clamp: %u entities exceed near_cap -> Tier B", prof->field_clamped);
     }
@@ -180,7 +183,7 @@ void hud_draw(Hud *h, VkCtx *ctx, VkCommandBuffer cmd, VkExtent2D extent, const 
         }
     }
     if (prof->field_r_a > 0.0f)
-        LINE(dim, "F1 hud  F2 detail  M model  -/= count  [ ] R_A  R reset");
+        LINE(dim, "F1 hud  F2 detail  M model  -/= count  [ ] R_A  ; ' R_mesh  K skel  R reset");
     else
         LINE(dim, "F1 hud  F2 detail  M model  T tier  B/123 backend  J jobs  H f16  -/= count  R reset  P promote");
     #undef LINE

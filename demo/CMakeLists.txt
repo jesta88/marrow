@@ -61,8 +61,10 @@ add_demo_shader(shaders/crowd.vert            vert crowd_skin_bench_vert -DMARRO
 add_demo_shader(shaders/crowd_static_bench.vert vert crowd_static_bench_vert)
 add_demo_shader(shaders/skin_tierA.vert vert skin_tierA_vert)
 add_demo_shader(shaders/skin_tierA_f16.vert vert skin_tierA_f16_vert)
-# Bone-line skeleton render LOD: posed via the Tier-B baked palette, drawn as a LINE_LIST.
-add_demo_shader(shaders/crowd_skel.vert vert crowd_skel_vert)
+# Bone-line skeleton render LOD, drawn as a LINE_LIST: the far tail poses from the Tier-B baked
+# palette (crowd_skel.vert), the near set from the CPU Tier-A palette SSBO (skin_tierA_skel.vert).
+add_demo_shader(shaders/crowd_skel.vert      vert crowd_skel_vert)
+add_demo_shader(shaders/skin_tierA_skel.vert vert skin_tierA_skel_vert)
 add_demo_shader(shaders/skel.frag       frag skel_frag)
 add_demo_shader(shaders/validate_skin.comp comp validate_skin_comp)
 add_demo_shader(shaders/validate_skin_f16.comp comp validate_skin_f16_comp)

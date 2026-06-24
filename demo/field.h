@@ -4,9 +4,9 @@
  * INDEPENDENT LODs:
  *   - ANIMATION tier (radius r_a): near -> Tier A (CPU, mrw_batch_blend_clips_to_palette, exact
  *     local-space clip cross-fade); far -> Tier B (baked GPU palette, crowd.vert).
- *   - RENDER LOD (radius r_mesh): near -> full skinned mesh; far -> bone-line skeleton (a cheap proxy).
- *     The skeleton tail is scaffolded here (persistent render_lod[] state) but still drawn as mesh -
- *     the bone-line draw lands in a later step.
+ *   - RENDER LOD (radius r_mesh): near -> full skinned mesh; far -> bone-line skeleton (a cheap proxy
+ *     that collapses ~432 verts/instance to ~2x bones, keeping the far tail off the vertex wall). A
+ *     global toggle (skeleton_all) renders the whole field as lines for the raw-scale view.
  *
  * Near and far run the SAME animation, differing only by tier - marrow's LOD-promotion contract made
  * visible: a foreground of CPU Tier-A characters seamlessly continuing into a massive baked Tier-B
@@ -95,16 +95,27 @@ typedef struct {
     VkBuffer pal_buf[VKC_FRAMES_IN_FLIGHT];  VkDeviceMemory pal_mem[VKC_FRAMES_IN_FLIGHT];
     void *pal_map[VKC_FRAMES_IN_FLIGHT];     VkDeviceAddress pal_addr[VKC_FRAMES_IN_FLIGHT];
 
-    /* near pipeline (skin_tierA.vert + crowd.frag, its own layout - same scalar push as the heroes) */
+    /* near pipeline (skin_tierA.vert + crowd.frag, its own layout - same scalar push as the heroes).
+     * vs_skel/fs_skel are the bone-line variant (skin_tierA_skel.vert + skel.frag) sharing that layout
+     * and the borrowed crowd's static bone VB; used only under the global all-skeleton toggle. */
     VkShaderEXT vs, fs; VkPipelineLayout layout;
+    VkShaderEXT vs_skel, fs_skel;
 
-    /* far Tier-B set - OWN InstanceAnim buffers, sized to total_capacity (Tier B has no 16k cap) */
+    /* far Tier-B set - OWN InstanceAnim buffers, sized to total_capacity (Tier B has no 16k cap). The
+     * far set is compacted into two contiguous sub-ranges: the full-mesh band [0, far_mesh_count) then
+     * the bone-line skeleton tail [far_mesh_count, far_count). */
     InstanceAnim     *far_stage;       /* total_capacity, cacheable; bulk-copied to the WC buffer */
     VkBuffer far_buf[VKC_FRAMES_IN_FLIGHT]; VkDeviceMemory far_mem[VKC_FRAMES_IN_FLIGHT];
     void *far_map[VKC_FRAMES_IN_FLIGHT];    VkDeviceAddress far_addr[VKC_FRAMES_IN_FLIGHT];
 
+    /* global render-mode toggle (--skeleton / K): draw the WHOLE field (near + far) as bone lines.
+     * When set, field_update forces every far entity into the skeleton sub-range and the near set is
+     * drawn through skin_tierA_skel.vert instead of the full mesh. */
+    int skeleton_all;
+
     /* this frame's split (published for the HUD / counters) */
     uint32_t near_count, far_count, near_clamped;
+    uint32_t far_mesh_count, far_skel_count;   /* far_count = far_mesh_count + far_skel_count */
 } Field;
 
 /* Build the field for `count` live entities (clamped to total_capacity). The borrowed Crowd supplies
@@ -118,10 +129,16 @@ void field_set_count(Field *f, uint32_t count);
 /* Advance phases, partition by distance (PROF_LOD), run the near batched blend (PALETTE_GEN), and
  * stage near + far into this frame-in-flight's buffers (PALETTE_UPLOAD). `frame` = ctx->cur_frame. */
 void field_update(Field *f, const float cam_pos[3], float dt, uint32_t frame, Profiler *prof);
-/* Far Tier-B band: one instanced baked-palette draw of the compacted far set (crowd_draw_instances). */
+/* Far Tier-B full-mesh band [0, far_mesh_count): one instanced baked-palette mesh draw. */
 void field_draw_far(Field *f, VkCtx *ctx, VkCommandBuffer cmd, const mat4 *view_proj, VkExtent2D extent);
-/* Near Tier-A band: one instanced skinned-mesh draw fetching the CPU-computed palette. */
+/* Far Tier-B skeleton tail [far_mesh_count, far_count): one instanced bone-line draw past R_mesh. */
+void field_draw_far_skeleton(Field *f, VkCtx *ctx, VkCommandBuffer cmd, const mat4 *view_proj, VkExtent2D extent);
+/* Near Tier-A band: one instanced skinned-mesh draw fetching the CPU-computed palette. Skipped under
+ * the global all-skeleton toggle (the near set then draws through field_draw_near_skeleton instead). */
 void field_draw_near(Field *f, VkCtx *ctx, VkCommandBuffer cmd, const mat4 *view_proj, VkExtent2D extent);
+/* Near Tier-A bone lines: the near set drawn as a skeleton from its CPU palette - only under the
+ * global all-skeleton toggle (a no-op otherwise). */
+void field_draw_near_skeleton(Field *f, VkCtx *ctx, VkCommandBuffer cmd, const mat4 *view_proj, VkExtent2D extent);
 void field_destroy(Field *f, VkCtx *ctx);
 
 #endif /* DEMO_FIELD_H */
