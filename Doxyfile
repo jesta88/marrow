@@ -1,0 +1,65 @@
+# Doxygen configuration for the marrow documentation site.
+#
+# Builds a static HTML site from the public header (marrow.h, the generated API
+# reference) plus the hand-written guides under site/. Output lands in out/docs/html
+# (out/ is git-ignored). Theme: Doxygen Awesome (vendored, MIT) under site/theme/.
+#
+#   doxygen Doxyfile      # then open out/docs/html/index.html
+#
+# Kept intentionally minimal: only options that differ from the defaults are set, so
+# the file stays readable and forward/backward compatible across Doxygen versions.
+
+# ---- project identity ----
+PROJECT_NAME           = "marrow"
+PROJECT_NUMBER         = "0.1.0"
+PROJECT_BRIEF          = "A pure-C11, zero-dependency animation runtime for games"
+OUTPUT_DIRECTORY       = out/docs
+
+# ---- inputs ----
+# The header is the single source of truth for the API reference; site/ holds the
+# narrative guides. Source dirs (src, tools, tests, demo, bench) are deliberately absent.
+INPUT                  = marrow.h site
+FILE_PATTERNS          = *.h *.md
+RECURSIVE              = YES
+EXCLUDE                = site/theme
+USE_MDFILE_AS_MAINPAGE = site/mainpage.md
+EXAMPLE_PATH           = examples
+IMAGE_PATH             = . site
+
+# ---- extraction (C library) ----
+# OPTIMIZE_OUTPUT_FOR_C drops the C++ class machinery from the output; TYPEDEF_HIDES_STRUCT
+# collapses `typedef struct X {..} X;` into a single entry. EXTRACT_ALL ensures every public
+# symbol appears even where the prose documents a group collectively rather than per-field;
+# the real documentation is the /** comments in the header, not a side effect of this flag.
+OPTIMIZE_OUTPUT_FOR_C  = YES
+TYPEDEF_HIDES_STRUCT   = YES
+EXTRACT_ALL            = YES
+EXTRACT_STATIC         = NO
+JAVADOC_AUTOBRIEF      = YES
+# Preserve the header's deliberate declaration order rather than alphabetizing.
+SORT_MEMBER_DOCS       = NO
+SORT_BRIEF_DOCS        = NO
+ALPHABETICAL_INDEX     = YES
+# The API lives under Topics + Data Structures; a per-file list (marrow.h + every .md) would
+# just add a redundant nav branch, so hide it.
+SHOW_FILES             = NO
+
+# ---- diagnostics: warnings are build failures ----
+# A broken @ref/@subpage, a bad image path, or malformed markup fails the build instead
+# of silently shipping. Undocumented members are not flagged (groups document collectively).
+QUIET                  = YES
+WARNINGS               = YES
+WARN_IF_UNDOCUMENTED   = NO
+WARN_IF_DOC_ERROR      = YES
+WARN_AS_ERROR          = FAIL_ON_WARNINGS
+
+# ---- HTML output (Doxygen Awesome theme) ----
+GENERATE_HTML          = YES
+GENERATE_LATEX         = NO
+HTML_OUTPUT            = html
+GENERATE_TREEVIEW      = YES
+DISABLE_INDEX          = NO
+FULL_SIDEBAR           = NO
+HTML_COLORSTYLE        = LIGHT
+HTML_EXTRA_STYLESHEET  = site/theme/doxygen-awesome.css \
+                         site/theme/doxygen-awesome-sidebar-only.css

@@ -10,6 +10,7 @@ project(marrow VERSION 0.1.0 LANGUAGES C CXX)
 
 option(MRW_BUILD_TESTS "Build marrow tests" ON)
 option(MRW_BUILD_TOOLS "Build marrow offline tools (gltf2marrow, marrow-bake)" ON)
+option(MRW_BUILD_EXAMPLES "Build the runnable API examples (examples/)" ON)
 option(MRW_BUILD_DEMO  "Build the Vulkan demo (separate target; needs Vulkan SDK)" OFF)
 option(MRW_BUILD_OZZ_BENCH "Build the ozz-animation throughput comparison (FetchContent ozz; never linked into the runtime)" OFF)
 # libFuzzer .mrw loader target. Needs Clang/clang-cl; on any other
@@ -181,6 +182,11 @@ endif()
 
 if (MRW_BUILD_TESTS)
   add_subdirectory(tests)
+endif()
+
+# Runnable examples (link the runtime via its public C ABI; never linked into it).
+if (MRW_BUILD_EXAMPLES)
+  add_subdirectory(examples)
 endif()
 
 # Buildable Vulkan demo (separate target; reuses the runtime + authoring/bake, never linked in).

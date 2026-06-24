@@ -21,6 +21,10 @@ specs to decode it, and leaves scheduling, GPU upload, and the animation state m
 The public API is the single header [`marrow.h`](marrow.h). All symbols are prefixed `mrw_`
 (types/functions) or `MRW_` (macros/enums). The on-disk format is `.mrw` (magic `MRRW`).
 
+📖 **Documentation:** **<https://jesta88.github.io/marrow/>** — quick start, how-to guides,
+concepts, and the API reference (generated from `marrow.h`). Built from [`site/`](site/) with
+Doxygen; see [`Doxyfile`](Doxyfile).
+
 ---
 
 ## Why marrow
