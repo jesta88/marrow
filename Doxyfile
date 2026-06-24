@@ -24,7 +24,9 @@ RECURSIVE              = YES
 EXCLUDE                = site/theme
 USE_MDFILE_AS_MAINPAGE = site/mainpage.md
 EXAMPLE_PATH           = examples
-IMAGE_PATH             = . site
+# Only the docs tree — never the repo root, whose recursive scan would also pick up the image
+# Doxygen copies into the (root-relative) output dir on a prior build, an ambiguity.
+IMAGE_PATH             = site
 
 # ---- extraction (C library) ----
 # OPTIMIZE_OUTPUT_FOR_C drops the C++ class machinery from the output; TYPEDEF_HIDES_STRUCT

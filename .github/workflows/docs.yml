@@ -28,7 +28,9 @@ jobs:
       - name: Install Doxygen
         run: sudo apt-get update && sudo apt-get install -y doxygen
       - name: Build site
-        run: doxygen Doxyfile
+        # Doxygen only creates the final OUTPUT_DIRECTORY segment, not missing parents, and a fresh
+        # checkout has no out/ — so create it first.
+        run: mkdir -p out/docs && doxygen Doxyfile
       - name: Upload Pages artifact
         if: github.event_name == 'push' && github.ref == 'refs/heads/master'
         uses: actions/upload-pages-artifact@v3

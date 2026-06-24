@@ -4,7 +4,7 @@
 
 **A pure-C11, zero-dependency, engine- and renderer-agnostic animation runtime for games.**
 
-![marrow's unified LOD field: 65,536 animated characters — a near CPU Tier-A foreground continuing into a baked Tier-B GPU crowd, the far tail collapsing into a bone-line skeleton horizon](hero.jpg)
+![marrow's unified LOD field: 65,536 animated characters — a near CPU Tier-A foreground continuing into a baked Tier-B GPU crowd, the far tail collapsing into a bone-line skeleton horizon](site/hero.jpg)
 
 *The [demo](demo/)'s unified LOD field at 65,536 entities: each character is classified per frame by camera distance into a CPU Tier-A foreground and a baked-GPU Tier-B crowd, the far tail rendered as bone-line skeletons.*
 
