@@ -18,6 +18,7 @@
  *           R reset perf stats, F1 toggle HUD, F2 HUD detail.
  * Flags: --count N, --lod-range R_A[,R_mesh], --skeleton, --cam X,Y,Z[,yaw,pitch], --no-hud,
  *        --frames N, --screenshot PATH (deterministic: fixed timestep + fixed camera + no input),
+ *        --video DIR (deterministic: dump every frame of a cinematic crowd fly-by as a PNG sequence),
  *        --validate, --validate-gpu, --bench [--bench-out FILE] [--smoke], --selftest-assets,
  *        --cycle-models, --field-smoke, --gltf PATH [--mrw PATH]. */
 #include <volk.h>
@@ -693,6 +694,47 @@ static void field_capture(VkCtx *ctx, Profiler *prof, Ground *ground, Field *fie
     }
 }
 
+/* Cinematic fly-by pose for the --video capture: a smooth swoop from a high establishing overview
+ * down into a low forward skim along the crowd, framed by a moving look-at target so the field stays
+ * in shot the whole way. `t` runs 0->1 across the clip and drives the camera entirely (so the capture
+ * is reproducible); --cam is ignored in video mode. */
+static void flyby_pose(Camera *cam, float t) {
+    float s = t * t * (3.0f - 2.0f * t);              /* ease in/out: start and settle gently */
+    float u = 1.0f - s;
+    float w0 = u * u, w1 = 2.0f * u * s, w2 = s * s;  /* quadratic Bezier weights */
+    /* position: high & back -> banked descent to one side -> low forward skim into the crowd */
+    vec3 p0 = v3(0.0f, 42.0f, 72.0f), p1 = v3(70.0f, 14.0f, -10.0f), p2 = v3(0.0f, 10.0f, -150.0f);
+    vec3 pos = v3_add(v3_add(v3_scale(p0, w0), v3_scale(p1, w1)), v3_scale(p2, w2));
+    /* look-at target sweeps down the crowd's length toward the bone-line skeleton horizon */
+    vec3 g0 = v3(0.0f, 2.0f, -40.0f), g1 = v3(10.0f, 2.0f, -160.0f), g2 = v3(0.0f, 3.0f, -340.0f);
+    vec3 tgt = v3_add(v3_add(v3_scale(g0, w0), v3_scale(g1, w1)), v3_scale(g2, w2));
+    vec3 fwd = v3_normalize(v3_sub(tgt, pos));
+    float fy = fwd.y < -1.0f ? -1.0f : (fwd.y > 1.0f ? 1.0f : fwd.y);
+    cam->pos = pos;
+    cam->pitch = asinf(fy);
+    cam->yaw   = atan2f(fwd.x, -fwd.z);   /* inverse of camera_forward: fwd=(sin y cos p, sin p, -cos y cos p) */
+}
+
+/* Drive `frames` fixed-step field frames along the fly-by, writing each to DIR/frame_NNNNN.png via the
+ * swapchain readback. Fixed timestep + camera-from-t + no input makes it reproducible, while the
+ * animation clock advances continuously so the crowd moves smoothly across the captured sequence. DIR
+ * must already exist (the PNG writer does not create directories). */
+static void field_flyby_capture(VkCtx *ctx, Profiler *prof, Ground *ground, Field *field, Hud *hud,
+                                Camera *cam, const char *model, int frames, const char *dir) {
+    const float dt = 1.0f / 60.0f;   /* fixed step: reproducible phase / weight / LOD partition */
+    if (frames < 1) frames = 1;
+    int rendered = 0;
+    char path[1024];
+    while (rendered < frames) {
+        glfwPollEvents();            /* pump the OS message queue; input is deliberately ignored */
+        float t = frames > 1 ? (float)rendered / (float)(frames - 1) : 0.0f;
+        flyby_pose(cam, t);
+        snprintf(path, sizeof path, "%s/frame_%05d.png", dir, rendered);
+        vkc_request_screenshot(ctx, path);   /* captured + written synchronously inside the next end_frame */
+        if (field_frame(ctx, prof, ground, field, hud, cam, dt, model, 0)) rendered++;
+    }
+}
+
 /* Headless field+skeleton smoke (hidden window, like --cycle-models): drive the unified LOD field
  * for a few fixed-step frames in BOTH render modes so every field draw path is CI-exercised -
  * default (near Tier-A mesh + far Tier-B mesh band + far bone-line tail past R_mesh), then the
@@ -732,9 +774,11 @@ int main(int argc, char **argv) {
     FieldLod lod = { .r_a = 35.0f, .r_mesh = 55.0f };   /* near band Tier-A; mesh out to R_mesh, skeleton tail beyond */
     float cam_arg[5] = { 0, 0, 0, 0, 0 }; int cam_set = 0;   /* --cam X,Y,Z[,yaw,pitch]: reproducible shot framing */
     const char *gltf_path = NULL, *mrw_path = NULL, *bench_out = NULL;
+    const char *video_dir = NULL;   /* --video DIR: dump a crowd fly-by as a PNG sequence into DIR */
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--frames") && i + 1 < argc) max_frames = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--screenshot") && i + 1 < argc) shot = argv[++i];
+        else if (!strcmp(argv[i], "--video") && i + 1 < argc) video_dir = argv[++i];
         else if (!strcmp(argv[i], "--count") && i + 1 < argc) { count = (uint32_t)strtoul(argv[++i], NULL, 10); count_set = 1; }
         else if (!strcmp(argv[i], "--lod-range") && i + 1 < argc) {
             /* R_A[,R_mesh] (world units): the animation-tier radius and the optional render-LOD radius */
@@ -766,6 +810,8 @@ int main(int argc, char **argv) {
     /* A bare --screenshot captures a deterministic frame deep enough that the GPU-timestamp readback
      * is warmed and the HUD frame-time graph (128-sample ring) is full; --frames N overrides. */
     if (shot && max_frames == 0) max_frames = 150;
+    /* --video defaults to a ~10-second fly-by at the fixed 1/60 step; --frames overrides the length. */
+    if (video_dir && max_frames == 0) max_frames = 600;
 
     /* Startup model: the procedural biped unless --gltf overrides it (which also drives the headless
      * --validate/--bench/--screenshot flows). The interactive path additionally discovers every baked
@@ -832,7 +878,7 @@ int main(int argc, char **argv) {
     /* The field's Tier B has no 16k ceiling, so the live-count knob (-/=) runs all the way to
      * FIELD_TOTAL_CAP. Default to a count that already shows BOTH tiers (a near Tier-A band + a large
      * far Tier-B crowd) unless --count overrode it. */
-    if (!count_set) count = shot ? 65536u : 8192u;   /* the headline screenshot wants a massive far crowd */
+    if (!count_set) count = (shot || video_dir) ? 65536u : 8192u;   /* the headline capture wants a massive far crowd */
     uint32_t capacity = FIELD_TOTAL_CAP;
     if (count > capacity) count = capacity;
 
@@ -861,6 +907,12 @@ int main(int argc, char **argv) {
         mg.field.lod = (FieldLod){ .r_a = 35.0f, .r_mesh = 90.0f };
         camera_init(&cam, v3(0.0f, 8.0f, 40.0f), 0.0f, -0.20f);
         rc = field_smoke_run(&ctx, &prof, &ground, &mg.field, &hud, &cam);
+    } else if (video_dir) {
+        /* deterministic fly-by capture: a moving cinematic camera over the massive crowd, every frame
+         * dumped as a PNG. The HUD is forced off for a clean reel (F1 can't toggle in headless capture). */
+        hud.visible = 0;
+        field_flyby_capture(&ctx, &prof, &ground, &mg.field, &hud, &cam,
+                            reg.items[model_idx].name, max_frames, video_dir);
     } else if (shot) {
         /* deterministic single-frame capture: fixed timestep + fixed camera + no input polling */
         field_capture(&ctx, &prof, &ground, &mg.field, &hud, &cam, reg.items[model_idx].name, max_frames, shot);
