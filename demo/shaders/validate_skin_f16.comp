@@ -1,0 +1,38 @@
+#version 450
+/* GPU-side validation of the Tier-A f16 full-matrix palette.
+ *
+ * The CPU batch (mrw_batch_clip_to_palette_f16) emits one instance's 3x4 affines as binary16; they
+ * are uploaded as an RGBA16F texture, 3 texels/joint (texel0=row0, texel1=row1, texel2=row2), and
+ * this shader skins every vertex with a DIRECT fetch + LBS - no quaternion, no renormalize, no
+ * temporal interp (unlike the Tier-B validate_skin.comp). The RGBA16F sampler load widens binary16
+ * to f32 exactly; texelFetch is an integer fetch with no filtering. The CPU then compares the
+ * skinned positions against the f32 mrw_clip_to_palette oracle - the gap is pure f16 quantization. */
+#extension GL_EXT_scalar_block_layout : require
+
+layout(local_size_x = 64) in;
+
+struct Vtx { vec3 pos; vec3 nrm; vec4 tan; uvec4 bones; vec4 weights; };
+
+layout(set = 0, binding = 0) uniform sampler2D uPalette;   /* RGBA16F, width = jointCount*3, height = 1 */
+layout(set = 0, binding = 1, scalar) readonly  buffer Verts { Vtx  v[];   };
+layout(set = 0, binding = 2, scalar) writeonly buffer Out   { vec4 pos[]; };
+
+layout(push_constant, scalar) uniform PC { uint vertCount; } pc;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= pc.vertCount) return;
+    Vtx vt = v[gid];
+    vec3 acc = vec3(0.0);
+    vec4 ph = vec4(vt.pos, 1.0);
+    for (int i = 0; i < 4; ++i) {
+        float wt = vt.weights[i];
+        if (wt == 0.0) continue;
+        int base = int(vt.bones[i]) * 3;                       /* 3 texels per joint */
+        vec4 r0 = texelFetch(uPalette, ivec2(base + 0, 0), 0);
+        vec4 r1 = texelFetch(uPalette, ivec2(base + 1, 0), 0);
+        vec4 r2 = texelFetch(uPalette, ivec2(base + 2, 0), 0);
+        acc += wt * vec3(dot(r0, ph), dot(r1, ph), dot(r2, ph));   /* M·[p,1] */
+    }
+    pos[gid] = vec4(acc, 1.0);
+}

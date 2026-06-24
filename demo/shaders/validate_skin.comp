@@ -1,0 +1,74 @@
+#version 450
+/* GPU-side validation: skin every mesh vertex on the GPU (Tier-B, single clip) and write the
+ * PRE-PROJECTION skinned position to an SSBO. The CPU then compares against the oracle built from
+ * mrw_baked_sample_bone - testing the shader's skinning transcription, not projection/rasterization.
+ * The decode/sample math is the same verbatim transcription as crowd.vert. */
+#extension GL_EXT_scalar_block_layout : require
+
+layout(local_size_x = 64) in;
+
+struct Vtx { vec3 pos; vec3 nrm; vec4 tan; uvec4 bones; vec4 weights; };
+
+layout(set = 0, binding = 0) uniform sampler2D uPalette;
+layout(set = 0, binding = 1, scalar) readonly  buffer Verts { Vtx  v[];   };
+layout(set = 0, binding = 2, scalar) writeonly buffer Out   { vec4 pos[]; };
+
+layout(push_constant, scalar) uniform PC {
+    uint  firstFrame, frameCount, looping, texelsPerBone;
+    float t, dur;
+    uint  vertCount;
+} pc;
+
+struct Xform { vec4 q; vec3 t; float s; };
+
+float modPos(float t, float d) { float m = t - d * trunc(t / d); if (m < 0.0) m += d; if (m >= d) m -= d; return m; }
+float clampf(float t, float lo, float hi) { return t < lo ? lo : (t > hi ? hi : t); }
+void quatToRows(vec4 q, out vec3 r0, out vec3 r1, out vec3 r2) {
+    float x=q.x,y=q.y,z=q.z,w=q.w, xx=x*x,yy=y*y,zz=z*z,xy=x*y,xz=x*z,yz=y*z,wx=w*x,wy=w*y,wz=w*z;
+    r0 = vec3(1.0-2.0*(yy+zz), 2.0*(xy-wz),     2.0*(xz+wy));
+    r1 = vec3(2.0*(xy+wz),     1.0-2.0*(xx+zz), 2.0*(yz-wx));
+    r2 = vec3(2.0*(xz-wy),     2.0*(yz+wx),     1.0-2.0*(xx+yy));
+}
+vec4 renorm(vec4 q) { float n2 = dot(q, q); return q * (n2 > 0.0 ? 1.0 / sqrt(n2) : 0.0); }
+vec4 nlerp(vec4 a, vec4 b, float u) { if (dot(a, b) < 0.0) b = -b; return renorm(mix(a, b, u)); }
+
+Xform decodeBone(int bone, int F) {
+    int x0 = bone * int(pc.texelsPerBone);
+    vec4 t0 = texelFetch(uPalette, ivec2(x0,     F), 0);
+    vec4 t1 = texelFetch(uPalette, ivec2(x0 + 1, F), 0);
+    Xform o; o.q = renorm(t0); o.t = t1.xyz; o.s = t1.w; return o;
+}
+Xform sampleClip(int bone, float t, float dur) {
+    int firstFrame = int(pc.firstFrame), frameCount = int(pc.frameCount);
+    bool looping = pc.looping != 0u;
+    int i0 = 0; float u = 0.0;
+    if (frameCount != 1 && dur != 0.0) {
+        float tl = looping ? modPos(t, dur) : clampf(t, 0.0, dur);
+        float fpos = (tl / dur) * float(frameCount - 1);
+        int i = int(floor(fpos));
+        if (i > frameCount - 2) i = frameCount - 2;
+        i0 = i; u = fpos - float(i);
+    }
+    Xform a = decodeBone(bone, firstFrame + i0);
+    if (u != 0.0) {
+        Xform b = decodeBone(bone, firstFrame + i0 + 1);
+        a.q = nlerp(a.q, b.q, u); a.t = mix(a.t, b.t, u); a.s = mix(a.s, b.s, u);
+    }
+    return a;
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= pc.vertCount) return;
+    Vtx vt = v[gid];
+    vec3 acc = vec3(0.0);
+    for (int i = 0; i < 4; ++i) {
+        float wt = vt.weights[i];
+        if (wt == 0.0) continue;
+        Xform xf = sampleClip(int(vt.bones[i]), pc.t, pc.dur);
+        vec3 r0, r1, r2; quatToRows(xf.q, r0, r1, r2);
+        vec3 rp = vec3(dot(r0, vt.pos), dot(r1, vt.pos), dot(r2, vt.pos));
+        acc += wt * (xf.s * rp + xf.t);
+    }
+    pos[gid] = vec4(acc, 1.0);
+}

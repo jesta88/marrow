@@ -1,0 +1,33 @@
+#version 450
+/* GPU-side validation of the LIVE Tier-A f16 SSBO fetch (skin_tierA_f16.vert's decode).
+ *
+ * The shipped CPU-crowd f16 draw reads the palette from a BDA SSBO as packed `uvec2 rows[]` and
+ * widens it with unpackHalf2x16 - a different consumer from the RGBA16F texture path. This shader
+ * exercises exactly that fetch: it reads the f16 palette via buffer_reference + unpackHalf2x16 and
+ * writes the decoded f32 3x4 rows back out. The CPU compares against mrw_half_to_float of the same
+ * bytes, so a wrong half lane order / uvec2 stride / endianness shows up as a mismatch. No skinning
+ * here - the LBS dot products are plain f32 math already covered by the f32 GPU readback. */
+#extension GL_EXT_buffer_reference2  : require
+#extension GL_EXT_scalar_block_layout : require
+
+layout(local_size_x = 64) in;
+
+layout(buffer_reference, scalar) readonly  buffer PaletteBuf { uvec2 rows[]; };   /* 3 packed rows / joint */
+layout(buffer_reference, scalar) writeonly buffer OutBuf     { vec4  rows[]; };   /* 3 decoded rows / joint */
+
+layout(push_constant, scalar) uniform PC {
+    PaletteBuf palette;
+    OutBuf     outp;
+    uint       jointCount;
+} pc;
+
+vec4 unpackRow(uvec2 p) { return vec4(unpackHalf2x16(p.x), unpackHalf2x16(p.y)); }
+
+void main() {
+    uint j = gl_GlobalInvocationID.x;
+    if (j >= pc.jointCount) return;
+    uint base = j * 3u;
+    pc.outp.rows[base + 0u] = unpackRow(pc.palette.rows[base + 0u]);
+    pc.outp.rows[base + 1u] = unpackRow(pc.palette.rows[base + 1u]);
+    pc.outp.rows[base + 2u] = unpackRow(pc.palette.rows[base + 2u]);
+}

@@ -1,0 +1,14 @@
+# libFuzzer dictionary for the .mrw loader.
+# Tokens are BINARY little-endian wire values, not textual constants - the mutator splices these
+# into inputs so it can reach past the magic/version/endian header gate and into deep validation.
+magic="MRRW"
+version_le="\x00\x00\x00\x00"
+endian_tag_le="\x01\x02\x03\x04"
+section_skeleton="\x01\x00\x00\x00"
+section_clip="\x02\x00\x00\x00"
+section_baked="\x03\x00\x00\x00"
+codec0="\x00\x00\x00\x00"
+codec1="\x01\x00\x00\x00"
+clip_flag_looping="\x01\x00\x00\x00"
+clip_flag_rootmotion="\x02\x00\x00\x00"
+parent_root="\xff\xff"

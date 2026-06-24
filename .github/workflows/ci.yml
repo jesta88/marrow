@@ -1,0 +1,149 @@
+# marrow CI: runs the full gate suite — randomized parity, golden bytes, C/C++ compile, the banned/ISA
+# scans, the libFuzzer .mrw loader fuzzer, and the ASan/UBSan/MSan sanitizer builds — across
+# compilers/OSes, so nothing depends on a developer running ctest by hand.
+#
+# Two "green proves nothing" guards are enforced: the scans run STRICT (-DMRW_SCAN_STRICT=ON ⇒ a missing
+# disassembler/object FAILS instead of silently skipping), and MRW_REQUIRE_AVX2=1 makes a job that claims
+# to test SIMD fail unless AVX2+FMA actually ran. The demo (Vulkan SDK) and the ozz bench (FetchContent)
+# stay out of CI — they are separate heavy gated targets.
+name: CI
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+  schedule:
+    - cron: '0 7 * * *'   # nightly longer fuzz run
+
+permissions:
+  contents: read
+
+jobs:
+  linux-gcc:
+    name: linux-gcc (strict scans + AVX2-required)
+    runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
+    steps:
+      - uses: actions/checkout@v7
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DMRW_SCAN_STRICT=ON
+      - name: Build
+        run: cmake --build build
+      - name: Test
+        env:
+          MRW_REQUIRE_AVX2: '1'   # GitHub x86-64 runners have AVX2; fail loudly if one ever doesn't
+        run: ctest --test-dir build --output-on-failure
+
+  linux-clang-asan-ubsan:
+    name: linux-clang ASan+UBSan
+    runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
+    env: { CC: clang, CXX: clang++ }
+    steps:
+      - uses: actions/checkout@v7
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build
+      # Tools OFF keeps third-party cgltf out of the instrumented graph (its UBSan findings aren't
+      # marrow runtime bugs); the first-party authoring/bake libs the tests need still build.
+      - name: Configure (ASan+UBSan)
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DMRW_SANITIZE=address,undefined -DMRW_BUILD_TOOLS=OFF
+      - name: Build
+        run: cmake --build build
+      - name: Test
+        env:
+          MRW_REQUIRE_AVX2: '1'
+          ASAN_OPTIONS: 'detect_leaks=1'
+          UBSAN_OPTIONS: 'print_stacktrace=1:halt_on_error=1'
+        run: ctest --test-dir build --output-on-failure
+
+  linux-clang-fuzz:
+    name: linux-clang fuzz smoke
+    runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
+    env: { CC: clang, CXX: clang++ }
+    steps:
+      - uses: actions/checkout@v7
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - name: Configure (libFuzzer)
+        run: cmake -S . -B build -G Ninja -DMRW_BUILD_FUZZ=ON -DMRW_BUILD_TOOLS=OFF
+      - name: Build
+        run: cmake --build build
+      - name: Portable corpus-coverage gate
+        run: ctest --test-dir build -R fuzz_replay --output-on-failure
+      - name: libFuzzer smoke (60s over the seed corpus)
+        env: { UBSAN_OPTIONS: 'halt_on_error=1' }   # belt-and-suspenders with -fno-sanitize-recover=all
+        run: |
+          mkdir -p /tmp/corpus && cp tests/fuzz/corpus/* /tmp/corpus/
+          ./build/tests/fuzz_blob -max_total_time=60 -dict=tests/fuzz/dict.txt /tmp/corpus
+      - name: Upload any crash reproducers
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-crashes
+          path: 'crash-*'
+          if-no-files-found: ignore
+
+  linux-clang-msan:
+    name: linux-clang MSan (signal, allowed-fail)
+    runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
+    continue-on-error: true   # MSan needs an instrumented libc/libc++ to be false-positive-free; signal only
+    env: { CC: clang, CXX: clang++ }
+    steps:
+      - uses: actions/checkout@v7
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - name: Configure (MSan, runtime + core tests)
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DMRW_SANITIZE=memory -DMRW_BUILD_TOOLS=OFF
+      - name: Build
+        run: cmake --build build
+      - name: Test (exclude the C++-link test — needs an MSan-instrumented libc++)
+        env: { MSAN_OPTIONS: 'halt_on_error=1' }
+        run: ctest --test-dir build -E test_cpp_link --output-on-failure
+
+  windows-msvc:
+    name: windows-msvc (strict scans + AVX2-required) + ASan
+    runs-on: windows-latest
+    if: github.event_name != 'schedule'
+    steps:
+      - uses: actions/checkout@v7
+      # These two are pinned at their latest releases, which still ship a Node 20 entrypoint
+      # (no Node 24 build exists upstream yet). GitHub forces them onto Node 24 and prints a
+      # deprecation warning — harmless; bump once upstream publishes a node24 release.
+      - uses: ilammy/msvc-dev-cmd@v1
+      - uses: seanmiddleditch/gha-setup-ninja@v4
+      - name: Configure (strict)
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DMRW_SCAN_STRICT=ON
+      - name: Build
+        run: cmake --build build
+      - name: Test
+        env: { MRW_REQUIRE_AVX2: '1' }
+        run: ctest --test-dir build --output-on-failure
+      - name: Configure (ASan)
+        run: cmake -S . -B build-asan -G Ninja -DCMAKE_BUILD_TYPE=Debug -DMRW_SANITIZE=address -DMRW_BUILD_TOOLS=OFF
+      - name: Build (ASan)
+        run: cmake --build build-asan
+      - name: Test (ASan)
+        run: ctest --test-dir build-asan --output-on-failure
+
+  nightly-fuzz:
+    name: nightly fuzz (10 min)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    env: { CC: clang, CXX: clang++ }
+    steps:
+      - uses: actions/checkout@v7
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - run: cmake -S . -B build -G Ninja -DMRW_BUILD_FUZZ=ON -DMRW_BUILD_TOOLS=OFF
+      - run: cmake --build build --target fuzz_blob
+      - name: Fuzz
+        env: { UBSAN_OPTIONS: 'halt_on_error=1' }
+        run: |
+          mkdir -p /tmp/corpus && cp tests/fuzz/corpus/* /tmp/corpus/
+          ./build/tests/fuzz_blob -max_total_time=600 -dict=tests/fuzz/dict.txt /tmp/corpus
+      - name: Upload any crash reproducers
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: nightly-fuzz-crashes
+          path: 'crash-*'
+          if-no-files-found: ignore
