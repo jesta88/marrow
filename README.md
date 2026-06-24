@@ -36,12 +36,31 @@ characters without tens of thousands of per-instance virtual calls.
 
 ## Performance
 
-On a shared-array rig, correctness-gated against [ozz-animation](https://github.com/guillaumeblanc/ozz-animation),
-marrow's fused across-instance AVX2 batch produces a **16 384-instance, 14-bone** skinning
-palette at **8.1 ns per (instance·joint) - 1.85 ms/frame, single-threaded - versus ozz's 34.7 ns
-(7.96 ms/frame): ~4.3× faster.** The gap widens at crowd scale: ozz's per-instance sampling
-contexts (≈32 MB at 16 k) spill L3, while marrow's `O(1)` scratch stays cache-resident. (ozz
-wins at `N = 1`: wide lanes go to waste on a single instance.)
+> Measured on an **AMD Ryzen 7 7700X** (Zen 4, 8C/16T), Release MSVC x64. marrow **AVX2+FMA** vs
+> **[ozz-animation](https://github.com/guillaumeblanc/ozz-animation) 0.16.0** (AVX2). Producing the per-instance 3×4 skinning palette (`model × inverse_bind`).
+
+**vs ozz — 14-bone lean rig, single-clip palette:**
+
+| Workload | marrow | ozz-animation | Speedup |
+|---|---|---|---|
+| 16 384 instances · 1 thread | **1.85 ms/frame** (8.1 ns/inst·joint) | 7.96 ms/frame (34.7 ns/inst·joint) | **4.3×** |
+| 65 536 instances · 16 threads | **1.09 ms/frame** | 4.68 ms/frame | **4.3×** |
+
+marrow overtakes ozz at **3+** shared-rig instances and is flat at ~2.85× across normal scenes; the gap
+widens to 4.3× at crowd scale, where ozz's per-instance sampling contexts (≈32 MB at 16 k) spill L3 while
+marrow's `O(1)` scratch stays cache-resident. ozz wins only at `N = 1–2`. Wide lanes go to waste on a
+lone instance, which should call the single-instance `mrw_clip_to_palette`.
+
+**f32 vs f16 palette** — the opt-in f16 output halves palette bytes; the win shows up on bandwidth-bound
+crowds (heavy 65-bone rig, 65 536 instances, 16 threads):
+
+| Palette | Bytes/joint | GPU upload/fetch | Heavy crowd (pooled) |
+|---|---|---|---|
+| **f32** (default) | 48 | 1.0× | 7.71 ms/frame |
+| **f16** (opt-in) | 24 | **0.5×** | **5.53 ms/frame** (1.4×) |
+
+f16 stays within ~1 mm of the f32 reference on a 3 m character (gated on skinned-vertex error), trading a
+little precision for half the GPU bandwidth and a write-bound crowd that turns compute-bound.
 
 ---
 
