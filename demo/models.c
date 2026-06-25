@@ -1,5 +1,13 @@
 /* See models.h. The platform-specific bits - locating the executable and listing a directory - are
  * isolated here behind Win32 / POSIX branches so main.c stays portable. */
+
+/* readlink/opendir/stat are POSIX names that glibc hides under strict -std=c11 (the demo target
+ * sets C_EXTENSIONS OFF). The feature macro must be defined before ANY system header is pulled in,
+ * so it sits above every #include. Ignored by MSVC. */
+#ifndef _WIN32
+#  define _POSIX_C_SOURCE 200809L
+#endif
+
 #include "models.h"
 
 #include <stdio.h>
